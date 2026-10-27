@@ -1,0 +1,33 @@
+# The planar controller: python -m planar in a container, set up from .env (see .env.example).
+#
+#   docker compose up -d --build     # build and start (it restarts with the machine)
+#   docker compose logs -f           # follow the log
+#   docker compose down              # stop and remove
+#
+# Host networking: the controller reaches the PMC as if it ran on this machine (the PMC's auto
+# search needs that), and the OPC UA server listens on this machine's port directly. Docker
+# Desktop (Windows, macOS) needs host networking switched on in its settings; or replace
+# network_mode with  ports: ["${OPCUA_PORT:-4840}:${OPCUA_PORT:-4840}"]  and set PMC_IP.
+
+services:
+  planar-controller:
+    build: .
+    image: planar-controller:latest
+    container_name: planar-controller
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      PMC_IP: ${PMC_IP:-}
+      OPCUA_ENDPOINT: opc.tcp://0.0.0.0:${OPCUA_PORT:-4840}/
+      SHUTTLES: ${SHUTTLES:-}
+      AUTOSTART: ${AUTOSTART:-0}
+      DISPLACE_HELD: ${DISPLACE_HELD:-0}
+      BLOCKED_TIMEOUT_S: ${BLOCKED_TIMEOUT_S:-0}
+      XBOT_SPEED: ${XBOT_SPEED:-0.5}
+      XBOT_ACCEL: ${XBOT_ACCEL:-2.0}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
