@@ -5,7 +5,8 @@ The OPC UA interface, laid out like a generated module's (work.md, "A generated 
   /Objects/<Module>/Module          Reset, Start, Stop, Abort, Clear (Session); State, ErrorID
   /Objects/<Module>/Skills/<Skill>  Start(Session, <parameters>), Stop, Abort, Reset (Session);
                                     State, ErrorID, Parameters/<p>, Results/<r>
-  /Objects/<Module>/Equipment/<Item>
+  /Objects/<Module>/Equipment/<Item>  the table's PMC: Connected and the layout (Columns, Rows,
+                                    FlywaySize, Holes); a shuttle's Xbot: X, Y, Rz, XbotState
 
 Every method answers [Accepted, ErrorID] at once. A MoveToPosition that was accepted finishes
 when the xbot has arrived: its State turns Succeeded (3), or Failed (4) with an ErrorID.
@@ -129,6 +130,17 @@ class OpcUaServer:
     async def _table_equipment(self, parent):
         pmc = await parent.add_object(self.idx, "PMC")
         await self._variable(pmc, "Connected", lambda: self.ctl.coordinator.connected, ua.VariantType.Boolean)
+        # The layout as the PMC reports it, for a client that draws or describes the table: Columns by
+        # Rows flyways of FlywaySize mm, without the Holes ("<column>,<row>" apart by spaces). Zero
+        # and empty until the PMC has been connected.
+        def layout(read, empty):
+            return lambda: read(self.ctl.coordinator.layout) if self.ctl.coordinator.layout else empty
+
+        await self._variable(pmc, "Columns", layout(lambda t: t.cols, 0), ua.VariantType.Int32)
+        await self._variable(pmc, "Rows", layout(lambda t: t.rows, 0), ua.VariantType.Int32)
+        await self._variable(pmc, "FlywaySize", layout(lambda t: t.flyway_size * 1000.0, 0.0), ua.VariantType.Double)
+        await self._variable(pmc, "Holes", layout(lambda t: " ".join(f"{c},{r}" for c, r in sorted(t.holes)), ""),
+                             ua.VariantType.String)
 
     async def _shuttle_equipment(self, parent, xid):
         xbot = await parent.add_object(self.idx, "Xbot")

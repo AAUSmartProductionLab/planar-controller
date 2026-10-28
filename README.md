@@ -86,7 +86,7 @@ Namespace `urn:aau:smartproductionlab:planar`. Modules: `PlanarTable` and `Plana
 | `Skills/MoveToPosition/Start(Session, X, Y, Rz)`, `Stop`, `Abort`, `Reset` `(Session)` | shuttles only; mm and degrees |
 | `Skills/MoveToPosition/State`, `ErrorID`, `Parameters/X,Y,Rz`, `Results/X,Y,Rz` | results: where it ended |
 | `Equipment/Xbot/X`, `Y`, `Rz`, `XbotState` | shuttles: the live pose |
-| `Equipment/PMC/Connected` | the table |
+| `Equipment/PMC/Connected`, `Columns`, `Rows`, `FlywaySize`, `Holes` | the table: the PMC's connection and the layout it reports (flyways of `FlywaySize` mm in `Columns` by `Rows`, without the `Holes`, given as `"<column>,<row>"` apart by spaces; 0 and empty until connected) |
 
 Every method answers `[Accepted, ErrorID]` at once. An accepted `MoveToPosition` finishes when
 the xbot has arrived: its `State` turns Succeeded (3), and Failed (4) with an `ErrorID` if it
