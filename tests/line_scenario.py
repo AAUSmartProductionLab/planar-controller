@@ -16,10 +16,14 @@ move ending Succeeded at its target, and a shuttle standing still while a statio
 Against a running controller (python -m planar):
 
     python tests/line_scenario.py --endpoint opc.tcp://127.0.0.1:4840/ --agents 3 --products 3
+
+The stations are STATIONS below unless --stations names a JSON file of {"<station>": [x, y, rz]} (mm,
+degrees, on the table), e.g. the modules' transfer points taken from their AASs.
 """
 
 import argparse
 import asyncio
+import json
 import random
 import sys
 import time
@@ -144,11 +148,12 @@ async def shuttles_of(opc):
 
 
 class ProductAgent:
-    def __init__(self, name, endpoint, shuttles, stations, report, rng, products, process_s, fail_p):
+    def __init__(self, name, endpoint, shuttles, stations, report, rng, products, process_s, fail_p, places=None):
         self.name = name
         self.endpoint = endpoint
         self.shuttles = shuttles
         self.stations = stations
+        self.places = places or STATIONS  # where each station is on the table
         self.report = report
         self.rng = rng
         self.products = products
@@ -209,7 +214,7 @@ class ProductAgent:
             await asyncio.sleep(0.2)
 
     async def move(self, opc, product, session, station, leaving):
-        x, y, rz = STATIONS[station]
+        x, y, rz = self.places[station]
         skill = (product.shuttle, "Skills", "MoveToPosition")
         t0 = time.monotonic()
         answer = await opc.call(skill, "Start", _s(session), _d(x), _d(y), _d(rz))
@@ -262,7 +267,10 @@ async def watch(endpoint, shuttles, report, stop):
         await opc.client.disconnect()
 
 
-async def run_line(endpoint, agents=3, products=3, process_s=(0.5, 1.5), fail_p=0.2, seed=1, sample=True):
+async def run_line(endpoint, agents=3, products=3, process_s=(0.5, 1.5), fail_p=0.2, seed=1, sample=True,
+                   places=None):
+    """``places``: where each station of ROUTE is, (x, y, rz) on the table; STATIONS if not given."""
+    places = dict(places or STATIONS)
     report = Report()
     opc = await _open(endpoint)
     try:
@@ -270,9 +278,9 @@ async def run_line(endpoint, agents=3, products=3, process_s=(0.5, 1.5), fail_p=
         shuttles = await shuttles_of(opc)
     finally:
         await opc.client.disconnect()
-    stations = {name: asyncio.Lock() for name in STATIONS}
+    stations = {name: asyncio.Lock() for name in places}
     workers = [ProductAgent(f"Agent{k + 1}", endpoint, shuttles, stations, report, random.Random(seed * 100 + k),
-                            products, process_s, fail_p) for k in range(agents)]
+                            products, process_s, fail_p, places) for k in range(agents)]
     stop = asyncio.Event()
     watcher = asyncio.create_task(watch(endpoint, shuttles, report, stop)) if sample else None
     try:
@@ -302,8 +310,14 @@ def main():
     p.add_argument("--products", type=int, default=3, help="per agent")
     p.add_argument("--fail", type=float, default=0.2, help="chance a process step fails")
     p.add_argument("--seed", type=int, default=1)
+    p.add_argument("--stations", help='a JSON file of {"<station>": [x, y, rz]} instead of STATIONS')
     args = p.parse_args()
-    report = asyncio.run(run_line(args.endpoint, args.agents, args.products, fail_p=args.fail, seed=args.seed))
+    places = None
+    if args.stations:
+        with open(args.stations, encoding="utf-8") as f:
+            places = {name: tuple(float(v) for v in pose) for name, pose in json.load(f).items()}
+    report = asyncio.run(run_line(args.endpoint, args.agents, args.products, fail_p=args.fail, seed=args.seed,
+                                  places=places))
     print(summary(report))
     sys.exit(1 if report.problems else 0)
 
