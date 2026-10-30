@@ -4,7 +4,8 @@ A small production line driven through OPC UA only, the way product agents would
 Five stations at or near the edge of the table, visited clockwise: Infeed, Filling, Stoppering,
 Capping, Outfeed. Each product agent has its own OPC UA client and session. Per product it
 
-1. occupies whichever shuttle is free (Occupy answers 5 while another session holds one),
+1. occupies the first free shuttle in the loading queue, or whichever is free without one (Occupy
+   answers 5 while another session holds one),
 2. takes it through the stations in order, holding each station while its step runs,
 3. may see a process step fail; the product is then discarded and goes straight to the Outfeed,
 4. releases the shuttle at the Outfeed and goes on with its next product.
@@ -202,8 +203,11 @@ class ProductAgent:
                   f"({' -> '.join(f'{s} {t:.1f}s' for s, t in product.steps)})", flush=True)
 
     async def occupy(self, opc, session):
+        """The first free shuttle in the loading queue (the one on the station), else any free one."""
         while True:
-            for shuttle in self.rng.sample(self.shuttles, len(self.shuttles)):
+            queue = (await opc.read("PlanarTable", "Equipment", "LoadingQueue")).split()
+            rest = self.rng.sample([s for s in self.shuttles if s not in queue], len(self.shuttles) - len(queue))
+            for shuttle in queue + rest:
                 answer = await opc.call((shuttle, "Occupation"), "Occupy", _s(session))
                 if answer == (True, 0):
                     return shuttle

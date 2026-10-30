@@ -21,11 +21,11 @@ def free_port():
         return s.getsockname()[1]
 
 
-async def _line(agents, products, seed):
+async def _line(agents, products, seed, loading_station=None):
     # Three xbots on the flyway centres of the left column, as in the simulation tool; fast moves.
     sim = SimDriver(SIM, {1: (0.12, 0.12, 0.0), 2: (0.12, 0.36, 0.0), 3: (0.12, 0.60, 0.0)},
                     speed=2.0, accel=10.0, turn_speed=20.0, turn_accel=200.0)
-    ctl = PlanarController(sim, [1, 2, 3])
+    ctl = PlanarController(sim, [1, 2, 3], loading_station=loading_station)
     ctl.coordinator.on_tick.insert(0, lambda: sim.advance(time.monotonic()))
     endpoint = f"opc.tcp://127.0.0.1:{free_port()}/"
     server = OpcUaServer(ctl, endpoint)
@@ -41,9 +41,12 @@ async def _line(agents, products, seed):
     return report, sim
 
 
-@pytest.mark.parametrize("agents,products,seed", [(3, 4, 1), (4, 3, 2)])
-def test_product_agents_run_the_line(agents, products, seed):
-    report, sim = asyncio.run(_line(agents, products, seed))
+INFEED = (0.06, 0.18)  # line_scenario.STATIONS["Infeed"], where the products are put on
+
+
+@pytest.mark.parametrize("agents,products,seed,loading_station", [(3, 4, 1, None), (4, 3, 2, None), (3, 4, 3, INFEED)])
+def test_product_agents_run_the_line(agents, products, seed, loading_station):
+    report, sim = asyncio.run(_line(agents, products, seed, loading_station))
     print(summary(report))
     assert not report.problems, report.problems
     assert not sim.collisions, sim.collisions[:3]

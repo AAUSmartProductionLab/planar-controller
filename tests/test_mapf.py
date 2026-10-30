@@ -3,7 +3,7 @@ import random
 import pytest
 
 from planar.layout import Layout
-from planar.mapf import Instance, plan, valid_step
+from planar.mapf import Instance, Motion, actions, execution_time, plan, valid_step
 
 LAB = Layout(cols=3, rows=4, holes=frozenset({(2, 3)}))
 SIM = Layout(cols=4, rows=3, holes=frozenset({(2, 1)}))
@@ -87,3 +87,40 @@ def test_of_the_shortest_paths_a_straight_one_is_taken():
         steps = [(b[0] - a[0], b[1] - a[1]) for a, b in zip(path, path[1:])]
         corners = sum(1 for a, b in zip(steps, steps[1:]) if a != b)
         assert corners <= 1, path
+
+
+def test_a_corner_costs_a_stop_and_a_start():
+    straight = [((0, 0),), ((1, 0),), ((2, 0),), ((3, 0),)]
+    corner = [((0, 0),), ((1, 0),), ((1, 1),), ((2, 1),)]
+    staircase = [((0, 0),), ((1, 0),), ((1, 1),), ((2, 1),), ((2, 2),)]
+    m = Motion()
+    assert execution_time(straight, m)[0] == pytest.approx(m.travel_time(3 * m.pitch))
+    assert execution_time(corner, m)[0] == pytest.approx(m.travel_time(m.pitch) * 3)
+    assert execution_time(straight, m)[0] < execution_time(corner, m)[0] < execution_time(staircase, m)[0]
+
+
+def test_a_follower_waits_until_the_one_ahead_has_left():
+    # 0 follows 1 along a row: it may start into (1, 0) only once 1 has reached (2, 0).
+    configs = [((0, 0), (1, 0)), ((1, 0), (2, 0))]
+    m = Motion()
+    (lead,), (follow,) = actions(configs)[1], actions(configs)[0]
+    assert follow[3] == lead[0]
+    assert execution_time(configs, m)[0] == pytest.approx(2 * m.travel_time(m.pitch))
+
+
+def test_slots_an_xbot_in_flight_has_to_leave_hold_the_plan_back():
+    # Something not in the plan is still leaving (1, 0) by its move 7.
+    (move,), = actions([((0, 0),), ((1, 0),)], first_id=10, leaving={(1, 0): 7})
+    assert move == (10, (0, 0), (1, 0), 7)
+
+
+def test_of_the_seeds_tried_the_fastest_plan_is_taken():
+    rng = random.Random(5)
+    cells = sorted(SIM.cells)
+    pick = rng.sample(cells, 32)
+    inst = Instance(SIM.cells, SIM.adjacency, pick[:16], pick[16:])
+    one = plan(inst, timeout=3, budget=0, max_seeds=1)
+    many = plan(inst, timeout=3, budget=10, max_seeds=12)
+    check(inst, many)
+    assert many.complete
+    assert execution_time(many.configs) <= execution_time(one.configs)

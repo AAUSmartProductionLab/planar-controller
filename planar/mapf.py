@@ -16,8 +16,13 @@ Multi-Agent Pathfinding", AAAI 2023), which searches over whole configurations a
 Finding", AIJ 2022) propose each next one. PIBT pushes xbots that are in the way and lets them
 push others in turn, which is what gets two xbots past each other in a one-lane passage; LaCAM
 makes the search complete: if every xbot can reach its goal, it finds a way.
+
+LaCAM's first plan depends on the seed that breaks PIBT's ties, so several seeds are tried while
+time allows, and the plan that is estimated to be done soonest wins (see execution_time): a
+corner, a detour or a wait for another xbot costs what it costs on the table.
 """
 
+import math
 import random
 import time
 from collections import deque
@@ -262,33 +267,116 @@ def lacam(instance, timeout=0.5, seed=0):
     return Result(path(best), best.config == inst.goals, expanded, time.monotonic() - t0)
 
 
-def _rank(result):
-    """Complete first, then the fewest steps, then the fewest moves and corners."""
-    configs = result.configs
-    moves = corners = 0
+@dataclass(frozen=True)
+class Motion:
+    """How the xbots move, for estimating how long a plan takes: slot pitch (m), m/s, m/s^2."""
+    pitch: float = 0.12
+    speed: float = 0.5
+    accel: float = 2.0
+
+    def travel_time(self, distance):
+        """A straight move from standstill to standstill (trapezoidal speed profile)."""
+        if distance <= 0:
+            return 0.0
+        if distance < self.speed * self.speed / self.accel:
+            return 2 * math.sqrt(distance / self.accel)
+        return distance / self.speed + self.speed / self.accel
+
+    def time_at(self, s, distance):
+        """When a straight move of this distance has covered s of it."""
+        v = min(self.speed, math.sqrt(distance * self.accel))
+        t_acc = v / self.accel
+        d_acc = 0.5 * self.accel * t_acc * t_acc
+        if s <= d_acc:
+            return math.sqrt(2 * s / self.accel)
+        if s <= distance - d_acc:
+            return t_acc + (s - d_acc) / v
+        return self.travel_time(distance) - math.sqrt(2 * max(0.0, distance - s) / self.accel)
+
+
+def actions(configs, first_id=1, leaving=None):
+    """
+    Each xbot's moves, one slot each, as (id, from, to, dep): it may start into `to` once the move
+    with id `dep` has been made (the xbot that was there before has left it), or at once if dep
+    is None. The coordinator executes a plan by exactly these dependencies.
+
+    Ids count up from first_id. leaving: {slot: id} for slots an xbot not in the plan still has
+    to leave (by the move with that id) before anyone may enter them.
+    """
+    n = len(configs[0])
+    out = [[] for _ in range(n)]
+    last_leave = dict(leaving or {})
+    next_id = first_id - 1
     for t in range(1, len(configs)):
-        for i, (a, b) in enumerate(zip(configs[t - 1], configs[t])):
-            if a == b:
+        before, after = configs[t - 1], configs[t]
+        moves = [(i, before[i], after[i]) for i in range(n) if before[i] != after[i]]
+        leaves = {}
+        for i, frm, to in moves:
+            next_id += 1
+            leaves[frm] = next_id
+        for i, frm, to in moves:
+            out[i].append((leaves[frm], frm, to, leaves.get(to, last_leave.get(to))))
+        last_leave.update(leaves)
+    return out
+
+
+def execution_time(configs, motion=Motion()):
+    """
+    (seconds until the last xbot is done, the sum of the seconds each xbot is done after) for
+    executing the plan as the coordinator does: an xbot starts a move once the move it depends on
+    has been made, and goes on in one straight motion through the slots ahead of it whose
+    dependencies are met by then, so every corner and every wait costs a stop and a start.
+    """
+    per_xbot = actions(configs)
+    done = {}  # action id -> when it was made (the xbot reached the next slot centre)
+    free = [0.0] * len(per_xbot)
+    nxt = [0] * len(per_xbot)
+    progress = True
+    while progress:
+        progress = False
+        for i, acts in enumerate(per_xbot):
+            if nxt[i] >= len(acts):
                 continue
-            moves += 1
-            before = configs[t - 2][i] if t >= 2 else a
-            if before != a and (a[0] - before[0], a[1] - before[1]) != (b[0] - a[0], b[1] - a[1]):
-                corners += 1
-    return (not result.complete, len(configs), moves + corners)
+            first = acts[nxt[i]]
+            if first[3] is not None and first[3] not in done:
+                continue
+            start = max(free[i], done.get(first[3], 0.0))
+            run = [first]
+            step = (first[2][0] - first[1][0], first[2][1] - first[1][1])
+            for a in acts[nxt[i] + 1:]:
+                if a[1] != run[-1][2] or (a[2][0] - a[1][0], a[2][1] - a[1][1]) != step:
+                    break
+                if a[3] is not None and done.get(a[3], math.inf) > start:
+                    break
+                run.append(a)
+            distance = len(run) * motion.pitch
+            for k, a in enumerate(run):
+                done[a[0]] = start + motion.time_at((k + 1) * motion.pitch, distance)
+            free[i] = start + motion.travel_time(distance)
+            nxt[i] += len(run)
+            progress = True
+    if any(nxt[i] < len(acts) for i, acts in enumerate(per_xbot)):
+        return math.inf, math.inf  # cannot happen for a valid plan
+    return max(free, default=0.0), sum(free)
 
 
-def plan(instance, timeout=0.5, tries=3, seed=0):
-    """LaCAM with a few seeds while time allows; the shortest complete plan wins."""
+def plan(instance, timeout=0.5, budget=0.05, seed=0, motion=Motion(), max_seeds=16):
+    """
+    LaCAM from one seed after the other: the first complete plan is taken, and while budget
+    seconds have not passed, more seeds are tried (up to max_seeds). Of the complete plans, the
+    one estimated to be done soonest wins (execution_time). Never longer than timeout.
+    """
     t0 = time.monotonic()
-    best = None
-    for k in range(tries):
+    best, best_key = None, None
+    for k in range(max_seeds):
         left = timeout - (time.monotonic() - t0)
         if left <= 0:
             break
         result = lacam(instance, timeout=left, seed=seed + k)
-        if best is None or _rank(result) < _rank(best):
-            best = result
-        if not result.complete:
-            break
+        key = (not result.complete, *execution_time(result.configs, motion))
+        if best is None or key < best_key:
+            best, best_key = result, key
+        if not result.complete or time.monotonic() - t0 >= budget:
+            break  # incomplete: it ran out of time, or there is no way
     best.seconds = time.monotonic() - t0
     return best

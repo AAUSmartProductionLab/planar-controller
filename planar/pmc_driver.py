@@ -22,8 +22,9 @@ from .statemachines import ErrorID
 log = logging.getLogger(__name__)
 
 _IDLE = {pm.XBOTSTATE.XBOT_IDLE}
+# XBOT_RESERVED1: driven by the PMC's auto routing
 _MOVING = {pm.XBOTSTATE.XBOT_MOTION, pm.XBOTSTATE.XBOT_WAIT, pm.XBOTSTATE.XBOT_STOPPING,
-           pm.XBOTSTATE.XBOT_HOLDPOSITION}
+           pm.XBOTSTATE.XBOT_HOLDPOSITION, pm.XBOTSTATE.XBOT_RESERVED1}
 _FAULT = {pm.XBOTSTATE.XBOT_ERROR, pm.XBOTSTATE.XBOT_OBSTACLE_DETECTED, pm.XBOTSTATE.XBOT_STOPPED}
 _READY_PMC = {pm.PMCSTATUS.PMC_FULLCTRL, pm.PMCSTATUS.PMC_INTELLIGENTCTRL}
 
@@ -149,5 +150,18 @@ class PmcDriver(Driver):
         with self._lock:
             try:
                 xbot_cmd.stop_motion(int(xid))
+            except Exception as e:
+                raise DriverError(str(e)) from e
+
+    def auto_drive(self, xids, targets):
+        """The PMC's auto routing, unlabelled: each xbot to one of the targets, whichever."""
+        with self._lock:
+            try:
+                xbot_cmd.auto_driving_motion_si_with_speed(
+                    xbot_count=len(xids), mode=pm.ASYNCOPTIONS.MOVEALL_UNLABELED,
+                    max_speed=float(self.speed), max_accel=float(self.accel),
+                    xbot_ids=[int(x) for x in xids],
+                    targets_x_meters=[float(t[0]) for t in targets],
+                    targets_y_meters=[float(t[1]) for t in targets])
             except Exception as e:
                 raise DriverError(str(e)) from e

@@ -13,6 +13,8 @@
 #   --pmc-ip IP       the PMC's address (empty: search the local network)
 #   --port N          the OPC UA port (4840)
 #   --shuttles LIST   the xbot ids to offer, e.g. 1,2,3 (empty: the ones the PMC knows)
+#   --loading-station X,Y  in mm: free xbots queue up there, and a Reset sends them there
+#   --idle-rz DEG     a multiple of 90: free xbots are turned to it, and a Reset turns them all
 #   --autostart       Reset and Start the table when the controller starts
 #   --no-autostart    leave it Stopped until it is Reset and Started over OPC UA (the default)
 #   --dir DIR         where to put the repository when not run from one (~/planar-controller)
@@ -34,6 +36,8 @@ while [ $# -gt 0 ]; do
         --pmc-ip) SETTINGS[PMC_IP]="$2"; shift 2 ;;
         --port) SETTINGS[OPCUA_PORT]="$2"; shift 2 ;;
         --shuttles) SETTINGS[SHUTTLES]="$2"; shift 2 ;;
+        --loading-station) SETTINGS[LOADING_STATION]="$2"; shift 2 ;;
+        --idle-rz) SETTINGS[IDLE_RZ]="$2"; shift 2 ;;
         --autostart) SETTINGS[AUTOSTART]=1; shift ;;
         --no-autostart) SETTINGS[AUTOSTART]=0; shift ;;
         --dir) DIR="$2"; shift 2 ;;

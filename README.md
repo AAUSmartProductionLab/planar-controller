@@ -29,6 +29,8 @@ cd planar-controller
 | `--pmc-ip IP` | the PMC's address (empty: search the local network) |
 | `--port N` | the OPC UA port (4840) |
 | `--shuttles LIST` | the xbot ids to offer, e.g. `1,2,3` (empty: the ones the PMC knows) |
+| `--loading-station X,Y` | in mm: free xbots queue up there, and a Reset sends them there (`LOADING_STATION`) |
+| `--idle-rz DEG` | a multiple of 90: free xbots are turned to it, and a Reset turns them all (`IDLE_RZ`) |
 | `--autostart` / `--no-autostart` | Reset and Start the table when the controller starts, or leave it Stopped (the default) |
 | `--dir DIR` | where to clone it when not run from a clone (`~/planar-controller`) |
 | `--branch NAME` | the branch to install (`main`) |
@@ -56,6 +58,8 @@ docker compose down              # stop
 | `AUTOSTART` | `0` | `1`: Reset and Start the table at start-up, and keep trying while the PMC is not there yet |
 | `DISPLACE_HELD` | `0` | `1`: the planner may push occupied shuttles that are not moving |
 | `BLOCKED_TIMEOUT_S` | `0` | seconds a move may wait without getting closer before it fails with Blocked (20); `0`: it waits until the way is free or it is stopped |
+| `LOADING_STATION` | empty | `X,Y` in mm, e.g. `60,180`: the xbots nobody holds queue up there, and the table's Reset sends them there (see below); empty: an xbot nobody holds stays where it was |
+| `IDLE_RZ` | empty | degrees, a multiple of 90, e.g. `0`: the xbots nobody holds are turned to it, and the table's Reset turns every shuttle to it; empty: as they are. Also `PlanarTable/Equipment/IdleRz` over OPC UA |
 | `XBOT_SPEED`, `XBOT_ACCEL` | `0.5`, `2.0` | m/s, m/s² |
 | `LOG_LEVEL` | `INFO` | |
 
@@ -87,6 +91,8 @@ Namespace `urn:aau:smartproductionlab:planar`. Modules: `PlanarTable` and `Plana
 | `Skills/MoveToPosition/State`, `ErrorID`, `Parameters/X,Y,Rz`, `Results/X,Y,Rz` | results: where it ended |
 | `Equipment/Xbot/X`, `Y`, `Rz`, `XbotState` | shuttles: the live pose |
 | `Equipment/PMC/Connected`, `Columns`, `Rows`, `FlywaySize`, `Holes` | the table: the PMC's connection and the layout it reports (flyways of `FlywaySize` mm in `Columns` by `Rows`, without the `Holes`, given as `"<column>,<row>"` apart by spaces; 0 and empty until connected) |
+| `Equipment/LoadingQueue` | the table: the free shuttles waiting at the loading station (and turned to `IdleRz`), the one on it first, apart by spaces (e.g. `"PlanarShuttle3 PlanarShuttle1"`): the one to occupy for the next product; empty without `LOADING_STATION` |
+| `Equipment/IdleRz` | the table, writable: the orientation in degrees free shuttles are turned to, a multiple of 90; NaN: as they are. Another value is not taken and reads back as it was. Starts as `IDLE_RZ` |
 
 Every method answers `[Accepted, ErrorID]` at once. An accepted `MoveToPosition` finishes when
 the xbot has arrived: its `State` turns Succeeded (3), and Failed (4) with an `ErrorID` if it
@@ -101,7 +107,12 @@ parameters are in range (8), then the PMC, the xbot and the target (21, 25 to 29
 
 **The modules** (PackML numbers): Stopped 2 -Reset-> Resetting 15 -> Idle 4 -Start-> Execute 6;
 Stop → Stopping 7 → Stopped; Abort → Aborted 9 -Clear-> Stopped. The table's Resetting connects
-to the PMC, takes mastership and levitates the xbots; a shuttle's checks that its xbot is there.
+to the PMC, takes mastership, levitates the xbots and, with `LOADING_STATION`, sends every shuttle
+into the loading queue with the PMC's auto routing (one command, up to 10 xbots; with more, or if
+the PMC refuses, the planner lines them up once they are free). The auto routing does not turn
+the xbots, so with `IdleRz` set the Resetting then turns each shuttle to it on a flyway centre
+before the table is Idle. A Stop meanwhile stops them. A shuttle's Resetting checks that its
+xbot is there.
 The table's Stop and Abort reach every shuttle, its Reset, Start and Clear the shuttles in the
 matching state, so one Reset and one Start of the table bring everything up. Only the occupant
 may command an occupied module; Abort is taken from anyone. A lost PMC connection aborts the
@@ -143,8 +154,19 @@ State 3, ... , `Release(id)`.
   straight move, slots or not.
 - Otherwise all xbots move as one plan (`planar/mapf.py`: LaCAM with PIBT). It finds a way
   whenever there is one, including two xbots passing each other in a one-lane passage by way of
-  a pocket, and pushes idle xbots out of the way, bringing them back afterwards. Of the shortest
-  routes it takes a straight one: a corner where it has to, not a staircase.
+  a pocket, and pushes idle xbots out of the way. Once it has a plan it tries more for up to
+  50 ms and takes the one estimated to be done soonest, the way it is executed: every corner and
+  every wait for another xbot costs a stop and a start, so a straight route wins over a
+  staircase and a detour that saves waiting can win over the shortest way.
+- A new plan is made as soon as anything changes (a request, an xbot taken or let go, a claim),
+  without stopping the others: an xbot on its way is planned on from where its motion ends, and
+  nobody enters a slot it has still to leave until it has left it.
+- Idle xbots nobody holds go back to where they were, or with `LOADING_STATION` queue up there:
+  the first on the slot under the station, the others on the slots nearest to it, along the
+  table's edge rather than into the table. When the first is taken, the queue closes up with as
+  few moves as it can. With `IdleRz` set, an idle xbot nobody holds that is turned otherwise
+  (released after a turned station, or `IdleRz` changed) turns to it on the nearest clear flyway;
+  a request for it replaces the turn at once.
 - An xbot whose shuttle is occupied and not moving is never pushed (a station may be working on
   it), nor one whose shuttle is not in Idle or Execute. If such xbots wall a target off, the move
   waits until they leave (or fails with Blocked after `BLOCKED_TIMEOUT_S`, if that is set).
@@ -153,8 +175,10 @@ State 3, ... , `Release(id)`.
 - Plans are executed by dependencies, not by time: an xbot starts into a slot only once the xbot
   that was there has fully left it, so a slow or late xbot cannot cause a collision.
 - The PMC rotates an xbot only on a flyway centre. A turn claims a whole flyway, waits until the
-  others have left it, drives to its centre, turns and drives out. An xbot travels only square to
-  the axes; another angle is possible only as the final pose on a flyway centre.
+  others have left it, drives to its centre, turns and drives out. Several claims may wait at
+  once, as long as every xbot that has to clear out of one can still get out of all of them; a
+  claim that has waited 5 s gives way to an older one still waiting. An xbot travels only square
+  to the axes; another angle is possible only as the final pose on a flyway centre.
 - Two xbots off the slots may stand side by side and touch (sharing slots): a final move, a turn
   or a step back onto a slot is checked against the other xbots' real squares. Into a gap between
   two xbots it touches on both sides it comes from one xbot width beside the gap, straight in,
@@ -181,7 +205,8 @@ python tests/stress_contention.py 40      # 480 runs: many xbots, one place, in 
 ```
 
 `tests/line_scenario.py` is a production line driven through OPC UA only: product agents, each
-with its own client and session, occupy whichever shuttle is free, take it clockwise through
+with its own client and session, occupy the first free shuttle in the loading queue (or whichever
+is free without one), take it clockwise through
 Infeed, Filling, Stoppering, Capping and Outfeed (stations at or near the edge of the 4 x 3
 simulation table), send the product straight to the Outfeed when a step fails, and release the
 shuttle there. `tests/test_line.py` runs it on the simulated driver; against a running

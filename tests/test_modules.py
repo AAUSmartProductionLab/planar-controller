@@ -1,3 +1,5 @@
+import math
+
 import pytest
 
 from planar.layout import Layout
@@ -13,10 +15,10 @@ def c(i, j):
 
 
 class Cell:
-    def __init__(self, xbots):
+    def __init__(self, xbots, **options):
         self.t = 0.0
         self.sim = SimDriver(STRIP, {xid: (x / 1000, y / 1000, 0.0) for xid, (x, y) in xbots.items()})
-        self.ctl = PlanarController(self.sim, sorted(xbots), clock=lambda: self.t, plan_timeout=0.3)
+        self.ctl = PlanarController(self.sim, sorted(xbots), clock=lambda: self.t, plan_timeout=0.3, **options)
         self.table = self.ctl.table
         self.s = self.ctl.shuttles
 
@@ -137,4 +139,41 @@ def test_an_occupied_idle_xbot_is_not_pushed_a_free_one_is():
     assert cell.run(30, lambda: skill.state == SkillState.SUCCEEDED)
     cell.run(10)
     assert cell.sim.at(2, *[v / 1000 for v in c(4, 0)]), "pushed aside and brought back"
+    assert not cell.sim.collisions
+
+
+def test_reset_routes_the_shuttles_into_the_loading_queue():
+    cell = Cell({1: c(7, 1), 2: c(4, 0), 3: c(6, 1)}, loading_station=(0.06, 0.06))
+    assert cell.table.command("Reset", "") == (True, ErrorID.NONE)
+    assert cell.run(1, lambda: cell.table.state == ModuleState.RESETTING)
+    assert [cmd for cmd in cell.sim.commands if cmd[2] == "auto"], "one auto routing command"
+    assert cell.run(30, lambda: cell.table.state == ModuleState.IDLE)
+    slots = {cell.ctl.coordinator.agents[x].cell for x in (1, 2, 3)}
+    assert slots == set(cell.ctl.coordinator.queue[:3]) and (0, 0) in slots
+    assert [cmd for cmd in cell.sim.commands if cmd[2] != "auto"] == [], "the planner had nothing to do"
+    assert not cell.sim.collisions
+
+
+def test_a_stop_during_resetting_stops_the_auto_routing():
+    cell = Cell({1: c(7, 1), 2: c(4, 0)}, loading_station=(0.06, 0.06))
+    assert cell.table.command("Reset", "") == (True, ErrorID.NONE)
+    cell.run(1.0)
+    assert cell.table.command("Stop", "") == (True, ErrorID.NONE)
+    assert cell.run(2, lambda: cell.table.state == ModuleState.STOPPED)
+    assert cell.sim.auto is None and all(xb.motion is None for xb in cell.sim.xbots.values())
+    x = cell.sim.xbots[1].x
+    cell.run(1.0)
+    assert cell.sim.xbots[1].x == x, "nothing moves after the Stop"
+
+
+def test_reset_turns_every_shuttle_to_the_idle_orientation():
+    cell = Cell({1: c(7, 1), 2: c(4, 0), 3: c(6, 1)}, loading_station=(0.06, 0.06), idle_rz=math.radians(90))
+    cell.sim.xbots[2].rz = math.radians(-90)
+    cell.sim.xbots[3].rz = math.radians(180)
+    assert cell.table.command("Reset", "") == (True, ErrorID.NONE)
+    assert cell.run(60, lambda: cell.table.state == ModuleState.IDLE)
+    for xid in (1, 2, 3):
+        xb = cell.sim.xbots[xid]
+        assert abs(xb.rz - math.radians(90)) < 0.01, (xid, xb.rz)
+        assert STRIP.cell_at(xb.x, xb.y, xb.rz) is not None, "back on a slot"
     assert not cell.sim.collisions

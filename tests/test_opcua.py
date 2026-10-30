@@ -1,4 +1,5 @@
 import asyncio
+import math
 import socket
 import time
 
@@ -80,6 +81,27 @@ async def _move_over_opc_ua():
             assert await wait(await path("PlanarShuttle1", "Skills", "MoveToPosition", "State"), int(SkillState.IDLE), 3)
 
             assert await call(await path("PlanarShuttle1", "Occupation"), "Release", session) == (True, ErrorID.NONE)
+
+            # The idle orientation: a multiple of 90 is taken, anything else reads back as it was.
+            idle_rz = await path("PlanarTable", "Equipment", "IdleRz")
+
+            async def taken(rz, timeout=3.0):  # the controller has it (a write lands on the node at once)
+                t0 = time.monotonic()
+                while time.monotonic() - t0 < timeout:
+                    if ctl.coordinator.idle_rz == rz:
+                        return True
+                    await asyncio.sleep(0.05)
+                return False
+
+            assert math.isnan(await idle_rz.read_value())
+            await idle_rz.write_value(ua.Variant(-90.0, ua.VariantType.Double))
+            assert await taken(math.radians(-90))
+            await idle_rz.write_value(ua.Variant(45.0, ua.VariantType.Double))
+            await asyncio.sleep(0.3)
+            assert await read("PlanarTable", "Equipment", "IdleRz") == -90.0, "refused: it reads back as it was"
+            assert ctl.coordinator.idle_rz == math.radians(-90)
+            await idle_rz.write_value(ua.Variant(math.nan, ua.VariantType.Double))
+            assert await taken(None)
             assert not sim.collisions
     finally:
         serving.cancel()

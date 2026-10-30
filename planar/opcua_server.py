@@ -6,7 +6,8 @@ The OPC UA interface, laid out like a generated module's (work.md, "A generated 
   /Objects/<Module>/Skills/<Skill>  Start(Session, <parameters>), Stop, Abort, Reset (Session);
                                     State, ErrorID, Parameters/<p>, Results/<r>
   /Objects/<Module>/Equipment/<Item>  the table's PMC: Connected and the layout (Columns, Rows,
-                                    FlywaySize, Holes); a shuttle's Xbot: X, Y, Rz, XbotState
+                                    FlywaySize, Holes), its LoadingQueue and IdleRz (writable); a
+                                    shuttle's Xbot: X, Y, Rz, XbotState
 
 Every method answers [Accepted, ErrorID] at once. A MoveToPosition that was accepted finishes
 when the xbot has arrived: its State turns Succeeded (3), or Failed (4) with an ErrorID.
@@ -54,6 +55,7 @@ class OpcUaServer:
         self.server = None
         self.idx = None
         self._publish = []  # (node, read() -> value, VariantType)
+        self._writable = []  # (node, write(value))
         self._last = {}
         self._refreshing = asyncio.Lock()
 
@@ -142,6 +144,26 @@ class OpcUaServer:
         await self._variable(pmc, "Holes", layout(lambda t: " ".join(f"{c},{r}" for c, r in sorted(t.holes)), ""),
                              ua.VariantType.String)
 
+        # The free shuttles waiting at the loading station, the one on it first, apart by spaces:
+        # the one to occupy for the next product. Empty without a loading station.
+        def queue():
+            names = {xid: s.name for xid, s in self.ctl.shuttles.items()}
+            return " ".join(names[x] for x in self.ctl.coordinator.queue_order() if x in names)
+
+        await self._variable(parent, "LoadingQueue", queue, ua.VariantType.String)
+
+        # The orientation idle shuttles are turned to, degrees: writable, a multiple of 90 or NaN
+        # (as they are); anything else is not taken and the value reads back as it was.
+        def idle_rz():
+            rz = self.ctl.coordinator.idle_rz
+            return math.nan if rz is None else math.degrees(rz)
+
+        def set_idle_rz(deg):
+            error = self.ctl.coordinator.set_idle_rz(math.radians(deg))
+            log.info("IdleRz %s: %s", deg, "set" if error == 0 else "refused (a multiple of 90 or NaN)")
+
+        await self._variable(parent, "IdleRz", idle_rz, ua.VariantType.Double, write=set_idle_rz)
+
     async def _shuttle_equipment(self, parent, xid):
         xbot = await parent.add_object(self.idx, "Xbot")
 
@@ -170,12 +192,17 @@ class OpcUaServer:
 
         await parent.add_method(self.idx, name, handler, inputs, ANSWER)
 
-    async def _variable(self, parent, name, read, vtype):
+    async def _variable(self, parent, name, read, vtype, write=None):
+        """A variable kept as read() says; with write, clients may write it: write(value) is
+        called with the controller's lock held, and the variable then reads as read() says."""
         with self.ctl.lock:
             value = read()
         node = await parent.add_variable(self.idx, name, ua.Variant(value, vtype))
         self._publish.append((node, read, vtype))
         self._last[node.nodeid] = value
+        if write is not None:
+            await node.set_writable()
+            self._writable.append((node, write))
 
     # --- keeping variables current -----------------------------------------------------------
 
@@ -183,10 +210,23 @@ class OpcUaServer:
         with self.ctl.lock:
             return [read() for _, read, _ in self._publish]
 
+    def _apply(self, write, value):
+        with self.ctl.lock:
+            write(value)
+
     async def _refresh(self):
         async with self._refreshing:  # one at a time, so an older snapshot never overwrites a newer
+            for node, write in self._writable:
+                value = await node.read_value()
+                if not _same(value, self._last.get(node.nodeid)):  # a client wrote it
+                    self._last[node.nodeid] = value
+                    await asyncio.to_thread(self._apply, write, value)
             values = await asyncio.to_thread(self._snapshot)
             for (node, _, vtype), value in zip(self._publish, values):
-                if self._last.get(node.nodeid) != value:
+                if not _same(self._last.get(node.nodeid), value):
                     self._last[node.nodeid] = value
                     await node.write_value(ua.Variant(value, vtype))
+
+
+def _same(a, b):
+    return a == b or (isinstance(a, float) and isinstance(b, float) and math.isnan(a) and math.isnan(b))

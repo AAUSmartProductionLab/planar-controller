@@ -389,3 +389,117 @@ def test_stopping_the_oldest_waiting_request_lets_the_next_one_in():
     assert h.run(30, h.done(1, 3))
     assert h.results[3][0][0] and h.sim.at(3, 0.12, 0.12)
     h.assert_no_collisions()
+
+
+def test_a_new_request_is_planned_while_others_are_on_their_way():
+    # 1 goes the long way along row 0 (the straight box is not free: 4 is in it); while it is on
+    # its way, 2 is sent around the held 3. 2 must not wait for 1 to arrive before it sets off.
+    h = Harness(SIM, {1: (*c(0, 0), 0.0), 2: (*c(0, 5), 0.0), 3: (*c(1, 5), 0.0), 4: (*c(5, 1), 0.0)})
+    for xid in (3, 4):
+        h.coord.hold(xid, True)
+    assert h.send(1, *c(7, 1)) == ErrorID.NONE
+    assert h.run(5, lambda: h.sim.xbots[1].motion is not None)
+    h.run(0.1)
+    assert h.send(2, *c(3, 5)) == ErrorID.NONE
+    assert h.run(5, lambda: any(cmd[1] == 2 for cmd in h.sim.commands))
+    assert h.sim.xbots[1].motion is not None, "2 set off while 1 was still on its way"
+    assert h.run(30, h.done(1, 2))
+    assert h.results[1][0][0] and h.results[2][0][0], h.results
+    h.assert_no_collisions()
+
+
+def test_two_turns_may_wait_for_their_flyways_to_clear_at_once():
+    # 3 idles on the flyway 1 turns on, 4 on the one 2 turns on: both claims wait at once.
+    h = Harness(SIM, {1: (*c(0, 0), 0.0), 2: (*c(6, 4), 0.0), 3: (*c(1, 1), 0.0), 4: (*c(7, 5), 0.0)})
+    with h.lock:
+        a1, a2 = h.coord.agents[1], h.coord.agents[2]
+        h.coord.submit(1, Pose(*c(0, 0), math.radians(90)), lambda *a: None)
+        h.coord.submit(2, Pose(*c(6, 4), math.radians(90)), lambda *a: None)
+        assert h.coord._claim(a1, (SIM.flyway_box((0, 0)),))
+        assert h.coord._claim(a2, (SIM.flyway_box((3, 2)),)), "a second claim waits alongside the first"
+    h.coord.agents[1].task = h.coord.agents[2].task = None
+    h.coord.agents[1].zone = h.coord.agents[2].zone = None
+    h.coord.agents[1].zone_boxes = h.coord.agents[2].zone_boxes = ()
+    assert h.send(1, *c(0, 0), rz_deg=90) == ErrorID.NONE
+    assert h.send(2, *c(6, 4), rz_deg=90) == ErrorID.NONE
+    assert h.run(30, h.done(1, 2))
+    assert h.results[1][0][0] and h.results[2][0][0], h.results
+    assert h.sim.at(1, *c(0, 0), math.radians(90)) and h.sim.at(2, *c(6, 4), math.radians(90))
+    h.assert_no_collisions()
+
+
+def test_a_claim_that_would_leave_no_way_out_is_not_made():
+    # On the strip: 3 idles in flyway (1, 0); the held 5 and 6 wall it off on the left. With 2's
+    # claim on flyway (2, 0) it could not get out of 1's claim on (1, 0) to anywhere.
+    h = Harness(STRIP, {1: (*c(3, 1), 0.0), 2: (*c(5, 1), 0.0), 3: (*c(2, 0), 0.0),
+                        5: (*c(1, 0), 0.0), 6: (*c(1, 1), 0.0)})
+    for xid in (5, 6):
+        h.coord.hold(xid, True)
+    h.run(0.1)
+    with h.lock:
+        a1, a2 = h.coord.agents[1], h.coord.agents[2]
+        for xid in (1, 2):
+            h.coord.submit(xid, Pose(*c(xid * 2 + 1, 1), math.radians(90)), lambda *a: None)
+        assert h.coord._claim(a1, (STRIP.flyway_box((1, 0)),))
+        assert not h.coord._claim(a2, (STRIP.flyway_box((2, 0)),))
+        assert h.coord._claim(a2, (STRIP.flyway_box((3, 0)),)), "one that leaves room is made"
+
+
+def test_idle_xbots_queue_up_at_the_loading_station():
+    # The station is the slot (0, 1) on the left edge; the queue goes along the edges.
+    h = Harness(SIM, {1: (*c(7, 5), 0.0), 2: (*c(4, 0), 0.0), 3: (*c(6, 2), 0.0)},
+                loading_station=c(0, 1))
+    assert h.coord.queue[:4] == [(0, 1), (0, 0), (0, 2), (1, 0)]
+    assert h.run(30, lambda: {h.coord.agents[x].cell for x in (1, 2, 3)} == {(0, 1), (0, 0), (0, 2)}
+                 and all(h.coord.agents[x].motion is None for x in (1, 2, 3)))
+    with h.lock:
+        order = h.coord.queue_order()
+    assert len(order) == 3 and h.coord.agents[order[0]].cell == (0, 1)
+    # The first one is taken (occupied) for a product and sent off; the queue closes up, with
+    # the fewest moves: the one at (0, 2) onto the station, the one at (0, 0) stays.
+    first, second, third = order
+    h.coord.hold(first, True)
+    sent = h.t
+    assert h.send(first, *c(7, 5)) == ErrorID.NONE
+    assert h.run(30, h.done(first))
+    assert h.run(30, lambda: h.coord.agents[third].cell == (0, 1) and h.coord.agents[third].motion is None)
+    assert h.coord.agents[second].cell == (0, 0)
+    assert not [cmd for cmd in h.sim.commands if cmd[1] == second and cmd[0] > sent]
+    with h.lock:
+        assert h.coord.queue_order() == [third, second]
+    h.assert_no_collisions()
+
+
+def test_idle_xbots_are_turned_to_the_idle_orientation_in_the_queue():
+    q = math.radians(90)
+    h = Harness(SIM, {1: (*c(7, 5), 0.0), 2: (*c(4, 0), q), 3: (*c(6, 2), -q)},
+                loading_station=c(0, 1), idle_rz=0.0)
+    assert h.run(60, lambda: all(h.coord.agents[x].task is None and h.coord.agents[x].motion is None
+                                 and abs(h.sim.xbots[x].rz) < 0.01 for x in (1, 2, 3))
+                 and {h.coord.agents[x].cell for x in (1, 2, 3)} == {(0, 1), (0, 0), (0, 2)})
+    assert [cmd[1] for cmd in h.sim.commands if cmd[2] == "rotate"] and 1 not in \
+        [cmd[1] for cmd in h.sim.commands if cmd[2] == "rotate"], "only the turned ones turn"
+    with h.lock:
+        assert len(h.coord.queue_order()) == 3
+    h.assert_no_collisions()
+
+
+def test_a_request_replaces_a_turn_to_the_idle_orientation():
+    h = Harness(SIM, {1: (*c(0, 0), math.radians(90))}, idle_rz=0.0)
+    assert h.run(1, lambda: h.coord.agents[1].task is not None)
+    assert h.coord.agents[1].task.internal
+    h.coord.hold(1, True)
+    assert h.send(1, *c(7, 5), rz_deg=90) == ErrorID.NONE, "not Busy: the turn gives way"
+    assert h.run(30, h.done(1))
+    assert h.results[1][0][0] and h.sim.at(1, *c(7, 5), math.radians(90))
+    h.run(5)
+    assert h.sim.at(1, *c(7, 5), math.radians(90)), "held: it stays as it was sent"
+    h.assert_no_collisions()
+
+
+def test_the_idle_orientation_is_a_multiple_of_90_degrees():
+    h = Harness(SIM, {1: (*c(0, 0), 0.0)})
+    assert h.coord.set_idle_rz(math.radians(45)) == ErrorID.OUT_OF_RANGE and h.coord.idle_rz is None
+    assert h.coord.set_idle_rz(math.radians(270)) == ErrorID.NONE
+    assert h.coord.idle_rz == pytest.approx(math.radians(-90))
+    assert h.coord.set_idle_rz(math.nan) == ErrorID.NONE and h.coord.idle_rz is None
