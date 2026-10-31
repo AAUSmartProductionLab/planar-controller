@@ -469,9 +469,9 @@ class Coordinator:
     def gather(self, xids, done):
         """
         Send these xbots into the loading queue with the PMC's auto routing, then turn them to
-        the idle orientation, then done(ok, error). Without a loading station, with more xbots
-        than one command takes or when the PMC will not route them, they are only turned: the
-        planner lines them up once they are free.
+        the idle orientation, then done(ok, error). With more xbots than one command takes or
+        when the PMC will not route them, the planner lines them up instead (it may move them
+        until done, whoever holds them); without a loading station they are only turned.
         """
         agents = [self.agents[x] for x in xids if x in self.agents and self.agents[x].present]
         for agent in agents:
@@ -528,12 +528,15 @@ class Coordinator:
                                 missing)
                 for agent in agents:
                     self._classify(agent)  # the turns follow next time round
-        elif not any(a.task is not None or a.in_macro or a.flying for a in agents):
-            wrong = [a for a in agents if a.cell is not None and self._turned_wrong(a)]
-            if wrong:  # not turned yet (or a turn that failed, once its pause is over)
-                for agent in wrong:
-                    if now >= agent.turn_after:
-                        self._turn_idle(agent)
+        else:
+            # The planner lines them up meanwhile; each turns as soon as it is on a slot (a turn
+            # that failed, once its pause is over).
+            for agent in agents:
+                if (agent.task is None and agent.cell is not None and self._turned_wrong(agent)
+                        and now >= agent.turn_after):
+                    self._turn_idle(agent)
+            if any(a.task is not None or a.in_macro or a.flying or a.actions or self._turned_wrong(a)
+                   for a in agents):
                 return
             self._gathering = None
             g.done(True, ErrorID.NONE)
@@ -1017,6 +1020,8 @@ class Coordinator:
     def _held(self, agent):
         if self.displace_held:
             return False
+        if self._gathering is not None and agent.xid in self._gathering.xids:
+            return False  # being lined up and turned: the planner may move it
         if self.held_by is not None:
             return self.held_by(agent.xid)
         return agent.held
@@ -1141,6 +1146,13 @@ class Coordinator:
                 if agent.task is not None and want is not None:
                     log.debug("xbot %d: waits, %s is not free", agent.xid, want)
                 want = self._closest_free(here, want or here, usable, free)
+            if want in taken:
+                # Boxed in, it can only stay where it is: the one given its slot goes elsewhere.
+                other = self.agents[next(x for x, g in goals.items() if g == want)]
+                goals[agent.xid] = want
+                del goals[other.xid]
+                settle(other, other.desired)
+                return
             goals[agent.xid] = want
             taken.add(want)
 

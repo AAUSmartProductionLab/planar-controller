@@ -109,7 +109,7 @@ parameters are in range (8), then the PMC, the xbot and the target (21, 25 to 29
 Stop → Stopping 7 → Stopped; Abort → Aborted 9 -Clear-> Stopped. The table's Resetting connects
 to the PMC, takes mastership, levitates the xbots and, with `LOADING_STATION`, sends every shuttle
 into the loading queue with the PMC's auto routing (one command, up to 10 xbots; with more, or if
-the PMC refuses, the planner lines them up once they are free). The auto routing does not turn
+the PMC refuses, the planner lines them up during the Resetting). The auto routing does not turn
 the xbots, so with `IdleRz` set the Resetting then turns each shuttle to it on a flyway centre
 before the table is Idle. A Stop meanwhile stops them. A shuttle's Resetting checks that its
 xbot is there.

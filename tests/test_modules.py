@@ -15,9 +15,9 @@ def c(i, j):
 
 
 class Cell:
-    def __init__(self, xbots, **options):
+    def __init__(self, xbots, layout=STRIP, **options):
         self.t = 0.0
-        self.sim = SimDriver(STRIP, {xid: (x / 1000, y / 1000, 0.0) for xid, (x, y) in xbots.items()})
+        self.sim = SimDriver(layout, {xid: (x / 1000, y / 1000, 0.0) for xid, (x, y) in xbots.items()})
         self.ctl = PlanarController(self.sim, sorted(xbots), clock=lambda: self.t, plan_timeout=0.3, **options)
         self.table = self.ctl.table
         self.s = self.ctl.shuttles
@@ -164,6 +164,33 @@ def test_a_stop_during_resetting_stops_the_auto_routing():
     x = cell.sim.xbots[1].x
     cell.run(1.0)
     assert cell.sim.xbots[1].x == x, "nothing moves after the Stop"
+
+
+def test_more_shuttles_than_one_auto_routing_command_takes_are_lined_up_by_the_planner():
+    table = Layout(cols=4, rows=3)  # 8 x 6 slots
+    xbots = {k + 1: c(7 - k % 4, 5 - k // 4) for k in range(12)}  # the far corner, 4 x 3
+    cell = Cell(xbots, layout=table, loading_station=(0.06, 0.06), idle_rz=math.radians(90))
+    assert cell.table.command("Reset", "") == (True, ErrorID.NONE)
+    assert cell.run(60, lambda: cell.table.state == ModuleState.IDLE)
+    assert not [cmd for cmd in cell.sim.commands if cmd[2] == "auto"], "no auto routing for 12"
+    assert {a.cell for a in cell.ctl.coordinator.agents.values()} == set(cell.ctl.coordinator.queue[:12])
+    assert all(abs(xb.rz - math.radians(90)) < 0.01 for xb in cell.sim.xbots.values())
+    assert not cell.sim.collisions
+
+
+def test_a_boxed_in_shuttle_keeps_its_slot_while_the_others_line_up_and_turn():
+    # Turns claim flyways near the queue; one xbot is left without a free slot it can reach, and
+    # the slot it stays on is not given to another as well.
+    slots = [(6, 3), (2, 4), (3, 4), (7, 2), (6, 5), (5, 3), (0, 1), (4, 5), (2, 3), (0, 3)]
+    angles = [180, 0, -90, 90, 180, 90, 0, 180, 0, 180]
+    cell = Cell({k + 1: c(*s) for k, s in enumerate(slots)}, layout=Layout(cols=4, rows=3),
+                loading_station=(0.06, 0.06), idle_rz=math.radians(90))
+    for k, deg in enumerate(angles):
+        cell.sim.xbots[k + 1].rz = math.radians(deg)
+    assert cell.table.command("Reset", "") == (True, ErrorID.NONE)
+    assert cell.run(60, lambda: cell.table.state == ModuleState.IDLE)
+    assert all(abs(xb.rz - math.radians(90)) < 0.01 for xb in cell.sim.xbots.values())
+    assert not cell.sim.collisions
 
 
 def test_reset_turns_every_shuttle_to_the_idle_orientation():
