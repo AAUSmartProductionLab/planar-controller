@@ -250,12 +250,29 @@ I>>+>>^#     #        a slot of no lane
   knows nothing of the lanes; the lanes apply from then on.
 - `LINE_LAYOUT` is read once at start-up. From a URL the controller waits for the server while it
   cannot be reached; a layout that is not valid JSON, or not a layout, stops it with the reason.
-  A JSON string holding the layout is read too, so it can be the `$value` of an AAS `Property`,
-  or the content of an AAS `File` element (its `/attachment`). `config/line-layout.example.json`
-  is the layout above; `config/` is mounted into the container.
+  `config/line-layout.example.json` is the layout above; `config/` is mounted into the container.
+- **From an AAS**: the layout is a `PlanarRouting` collection in the line's `Parameters`, and
+  `LINE_LAYOUT` is its `$value` (`…/submodels/<Parameters>/submodel-elements/PlanarRouting/$value`):
+
+  ```
+  PlanarRouting       SubmodelElementCollection
+    Lanes             SubmodelElementList, a collection per lane:
+      Name            Property xs:string
+      OneWay          Property xs:boolean
+      Points          SubmodelElementList of points
+    TurnSpots         SubmodelElementList of points
+    IdleArea          SubmodelElementList of points
+  a point             SubmodelElementCollection: X, Y, Properties xs:double in mm
+  ```
+
+  Its value is read as the repository gives it, e.g.
+  `{"Lanes": [{"Name": "loop", "OneWay": "true", "Points": [{"X": "180", "Y": "180"}, …]}], "TurnSpots": […], "IdleArea": […]}`
+  (BaSyx gives the values as text; numbers and `true`/`false` are read too). A JSON string
+  holding the file's form is read as well (the `$value` of a `Property`, or an AAS `File`'s
+  `/attachment`).
 - The lab's AAS Web UI draws it: its Configurator (Production lines, Shuttle routing) lays out the
   lanes, turn spots and idle area on the table as the table's AAS reports it, checks them as the
-  controller does, keeps them in the line's AAS (`Parameters/PlanarRouting/Value`) and shows the
+  controller does, keeps them in the line's AAS as that `PlanarRouting` collection and shows the
   `LINE_LAYOUT` URL to set.
 
 ## Development

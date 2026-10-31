@@ -115,6 +115,37 @@ def test_a_layout_inside_a_json_string_is_read_too():
     assert len(spec.lanes) == 2 and spec.idle_area[0] == (0.06, 0.18)
 
 
+def aas_form(layout):
+    """The layout as the $value of an AAS PlanarRouting collection, its values as text (as BaSyx
+    gives them)."""
+    point = lambda p: {"X": str(p[0]), "Y": str(p[1])}
+    return {"Lanes": [{"Name": lane.get("name", ""), "OneWay": str(lane.get("oneWay", False)).lower(),
+                       "Points": [point(p) for p in lane["points"]]} for lane in layout["lanes"]],
+            "TurnSpots": [point(p) for p in layout.get("turnSpots", [])],
+            "IdleArea": [point(p) for p in layout.get("idleArea", [])]}
+
+
+def test_a_layout_is_read_from_an_aas_planar_routing_collection():
+    spec = parse(json.dumps(aas_form(LOOP)))
+    assert spec.lanes == parse(json.dumps(LOOP)).lanes
+    assert spec.turn_spots == ((0.84, 0.36),) and spec.idle_area == ((0.06, 0.18), (0.06, 0.54))
+    assert lines(aas_form(LOOP)).describe() == lines().describe()
+    typed = {"Lanes": [{"Name": "", "OneWay": True, "Points": [{"X": 60, "Y": 60}, {"X": 900.0, "Y": 60}]}]}
+    assert parse(json.dumps(typed)).lanes[0].name == "lane 1" and parse(json.dumps(typed)).lanes[0].one_way
+
+
+@pytest.mark.parametrize("value, message", [
+    ({"Lanes": [], "Stations": []}, "PlanarRouting: unknown Stations"),
+    ({"Lanes": []}, "at least one lane"),
+    ({"Lanes": [{"Points": [{"X": "60", "Y": "60"}, {"X": "a", "Y": "60"}]}]}, "'a' is not a number"),
+    ({"Lanes": [{"Points": [{"X": "60", "Y": "60"}, [180, 60]]}]}, "not a point with X and Y"),
+    ({"Lanes": [{"Points": [{"X": "60", "Y": "60"}, {"X": "180", "Y": "60"}], "OneWay": "yes"}]}, "oneWay is true or false"),
+])
+def test_what_is_no_planar_routing_says_why(value, message):
+    with pytest.raises(LineError, match=message):
+        parse(json.dumps(value))
+
+
 def test_lanes_are_driven_only_along_them_and_one_way_lanes_only_forward():
     ln = lines()
     on_lanes = lambda cell: {d for d in ln.graph[cell] if d in ln.lane_cells}
@@ -241,7 +272,7 @@ def test_the_example_layout_fits_the_4_by_3_table():
 
 
 def test_a_layout_is_fetched_from_a_url_as_from_an_aas_server():
-    body = json.dumps(json.dumps(LOOP)).encode()  # a Property's $value: the JSON as a JSON string
+    body = json.dumps(aas_form(LOOP)).encode()  # the PlanarRouting collection's $value
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -256,7 +287,7 @@ def test_a_layout_is_fetched_from_a_url_as_from_an_aas_server():
     server = HTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
-        spec = load(f"http://127.0.0.1:{server.server_port}/submodels/x/submodel-elements/LineLayout/$value")
+        spec = load(f"http://127.0.0.1:{server.server_port}/submodels/x/submodel-elements/PlanarRouting/$value")
     finally:
         server.shutdown()
     assert Lines(spec, TABLE).idle == lines().idle

@@ -17,7 +17,8 @@ Environment (each also an option, see --help):
   MODE            free (the default): the xbots may travel anywhere on the table; line: only
                   on the lanes of LINE_LAYOUT (see planar/lines.py)
   LINE_LAYOUT     line mode: the layout's JSON file, or an http(s) URL to fetch it from (e.g.
-                  an AAS submodel element's file); its idleArea is the loading queue
+                  the $value of the line AAS's Parameters/PlanarRouting); its idleArea is the
+                  loading queue
   XBOT_SPEED      m/s (0.5), XBOT_ACCEL m/s^2 (2.0)
   LOG_LEVEL       INFO
 """

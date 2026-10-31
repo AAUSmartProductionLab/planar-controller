@@ -30,6 +30,21 @@ The layout is JSON, in mm in the table's coordinates (as the skill's X and Y):
 
 The planner then plans on the directed graph of slots this gives (graph), and keeps every xbot
 off the slots it may not use (keep_out).
+
+In an AAS the layout is a collection, PlanarRouting (in the line's Parameters), and its $value is
+read as it is:
+
+    PlanarRouting                  SubmodelElementCollection
+      Lanes                        SubmodelElementList of collections, each:
+        Name                         Property xs:string
+        OneWay                       Property xs:boolean
+        Points                       SubmodelElementList of points
+      TurnSpots                    SubmodelElementList of points
+      IdleArea                     SubmodelElementList of points
+    a point:                       SubmodelElementCollection of X and Y, Properties xs:double in mm
+
+    {"Lanes": [{"Name": "loop", "OneWay": "true", "Points": [{"X": "180", "Y": "180"}, ...]}],
+     "TurnSpots": [{"X": "840", "Y": "360"}], "IdleArea": [...]}
 """
 
 import json
@@ -64,8 +79,8 @@ class LineSpec:
 
 
 def load(source):
-    """The layout from a file or an http(s) URL (e.g. a file element of an AAS submodel). OSError
-    if it cannot be read, LineError if it is no layout."""
+    """The layout from a file or an http(s) URL (e.g. the $value of a PlanarRouting collection in
+    an AAS repository). OSError if it cannot be read, LineError if it is no layout."""
     if source.startswith(("http://", "https://")):
         with urllib.request.urlopen(source, timeout=10) as response:
             data = response.read()
@@ -87,6 +102,8 @@ def parse(text):
         raise LineError(f"the line layout is not JSON: {e}") from None
     if not isinstance(data, dict):
         raise LineError("the line layout must be a JSON object with lanes, turnSpots and idleArea")
+    if "Lanes" in data:
+        data = _from_aas(data)
     _known(data, {"lanes", "turnSpots", "idleArea"}, "the line layout")
     lanes = data.get("lanes")
     if not isinstance(lanes, list) or not lanes:
@@ -103,6 +120,50 @@ def parse(text):
         out.append(Lane(name, _points(lane.get("points"), f"{name}: points", 2), one_way))
     return LineSpec(tuple(out), _points(data.get("turnSpots", []), "turnSpots", 0),
                     _points(data.get("idleArea", []), "idleArea", 0), text)
+
+
+def _from_aas(data):
+    """The layout from the value of an AAS PlanarRouting collection (its $value, see above) in the
+    JSON file's form. A repository may give the values as text ("180", "true")."""
+    _known(data, {"Lanes", "TurnSpots", "IdleArea"}, "PlanarRouting")
+
+    def number(v, what):
+        if isinstance(v, str):
+            try:
+                v = float(v)
+            except ValueError:
+                pass
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+            raise LineError(f"{what}: {v!r} is not a number in mm")
+        return v
+
+    def points(value, what):
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise LineError(f"{what}: a list of points, each with X and Y in mm")
+        out = []
+        for p in value:
+            if not isinstance(p, dict) or set(p) != {"X", "Y"}:
+                raise LineError(f"{what}: {p!r} is not a point with X and Y in mm")
+            out.append([number(p["X"], what), number(p["Y"], what)])
+        return out
+
+    lanes = data.get("Lanes")
+    if not isinstance(lanes, list):
+        raise LineError("Lanes: a list of lanes")
+    out = []
+    for k, lane in enumerate(lanes):
+        if not isinstance(lane, dict):
+            raise LineError(f"Lanes[{k}]: a lane with Name, OneWay and Points")
+        name = str(lane.get("Name") or f"lane {k + 1}")
+        _known(lane, {"Name", "OneWay", "Points"}, name)
+        one_way = lane.get("OneWay", False)
+        if isinstance(one_way, str) and one_way.lower() in ("true", "false"):
+            one_way = one_way.lower() == "true"
+        out.append({"name": name, "points": points(lane.get("Points"), f"{name}: Points"), "oneWay": one_way})
+    return {"lanes": out, "turnSpots": points(data.get("TurnSpots"), "TurnSpots"),
+            "idleArea": points(data.get("IdleArea"), "IdleArea")}
 
 
 def _known(data, keys, what):
