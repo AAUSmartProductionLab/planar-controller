@@ -249,6 +249,10 @@ I>>+>>^#     #        a slot of no lane
   A JSON string holding the layout is read too, so it can be the `$value` of an AAS `Property`,
   or the content of an AAS `File` element (its `/attachment`). `config/line-layout.example.json`
   is the layout above; `config/` is mounted into the container.
+- The lab's AAS Web UI draws it: its Configurator (Production lines, Shuttle routing) lays out the
+  lanes, turn spots and idle area on the table as the table's AAS reports it, checks them as the
+  controller does, keeps them in the line's AAS (`Parameters/PlanarRouting/Value`) and shows the
+  `LINE_LAYOUT` URL to set.
 
 ## Development
 
