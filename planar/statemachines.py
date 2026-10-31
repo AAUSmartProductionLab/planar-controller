@@ -50,6 +50,7 @@ class ErrorID(IntEnum):
     XBOT_NOT_DETECTED = 28  # the PMC does not report this xbot (missing or landed)
     XBOT_CROOKED = 29       # turned off the axes away from a flyway centre: it cannot travel
     MOTION_DEVIATED = 30    # a move ended somewhere else than it was sent
+    LINE_LAYOUT_INVALID = 31  # line mode: the line layout does not fit the table (see the log)
 
 
 class SkillState(IntEnum):

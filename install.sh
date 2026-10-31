@@ -15,6 +15,8 @@
 #   --shuttles LIST   the xbot ids to offer, e.g. 1,2,3 (empty: the ones the PMC knows)
 #   --loading-station X,Y  in mm: free xbots queue up there, and a Reset sends them there
 #   --idle-rz DEG     a multiple of 90: free xbots are turned to it, and a Reset turns them all
+#   --mode free|line  anywhere on the table, or only on the lanes of --line-layout (free)
+#   --line-layout FILE|URL  line mode: the layout, a file in config/ (config/NAME.json) or a URL
 #   --autostart       Reset and Start the table when the controller starts
 #   --no-autostart    leave it Stopped until it is Reset and Started over OPC UA (the default)
 #   --dir DIR         where to put the repository when not run from one (~/planar-controller)
@@ -38,6 +40,8 @@ while [ $# -gt 0 ]; do
         --shuttles) SETTINGS[SHUTTLES]="$2"; shift 2 ;;
         --loading-station) SETTINGS[LOADING_STATION]="$2"; shift 2 ;;
         --idle-rz) SETTINGS[IDLE_RZ]="$2"; shift 2 ;;
+        --mode) SETTINGS[MODE]="$2"; shift 2 ;;
+        --line-layout) SETTINGS[LINE_LAYOUT]="$2"; shift 2 ;;
         --autostart) SETTINGS[AUTOSTART]=1; shift ;;
         --no-autostart) SETTINGS[AUTOSTART]=0; shift ;;
         --dir) DIR="$2"; shift 2 ;;
@@ -115,7 +119,8 @@ fi
 for key in "${!SETTINGS[@]}"; do
     value="${SETTINGS[$key]}"
     if grep -qE "^${key}=" .env; then
-        sed -i "s|^${key}=.*|${key}=${value}|" .env
+        escaped=$(printf '%s' "$value" | sed 's/[&|\\]/\\&/g')  # a URL may hold & or |
+        sed -i "s|^${key}=.*|${key}=${escaped}|" .env
     else
         printf '%s=%s\n' "$key" "$value" >> .env
     fi

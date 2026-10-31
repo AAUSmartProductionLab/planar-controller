@@ -65,6 +65,7 @@ async def _move_over_opc_ua():
             assert await wait(await path("PlanarTable", "Module", "State"), int(ModuleState.IDLE))
             pmc = ("PlanarTable", "Equipment", "PMC")
             assert [await read(*pmc, n) for n in ("Columns", "Rows", "FlywaySize", "Holes")] == [4, 3, 240.0, "2,1"]
+            assert [await read("PlanarTable", "Equipment", n) for n in ("Mode", "LineLayout")] == ["free", ""]
             assert await call(table, "Start", session) == (True, ErrorID.NONE)
             assert await wait(await path("PlanarShuttle1", "Module", "State"), int(ModuleState.EXECUTE))
 

@@ -6,8 +6,8 @@ The OPC UA interface, laid out like a generated module's (work.md, "A generated 
   /Objects/<Module>/Skills/<Skill>  Start(Session, <parameters>), Stop, Abort, Reset (Session);
                                     State, ErrorID, Parameters/<p>, Results/<r>
   /Objects/<Module>/Equipment/<Item>  the table's PMC: Connected and the layout (Columns, Rows,
-                                    FlywaySize, Holes), its LoadingQueue and IdleRz (writable); a
-                                    shuttle's Xbot: X, Y, Rz, XbotState
+                                    FlywaySize, Holes), its LoadingQueue, IdleRz (writable), Mode
+                                    and LineLayout; a shuttle's Xbot: X, Y, Rz, XbotState
 
 Every method answers [Accepted, ErrorID] at once. A MoveToPosition that was accepted finishes
 when the xbot has arrived: its State turns Succeeded (3), or Failed (4) with an ErrorID.
@@ -163,6 +163,11 @@ class OpcUaServer:
             log.info("IdleRz %s: %s", deg, "set" if error == 0 else "refused (a multiple of 90 or NaN)")
 
         await self._variable(parent, "IdleRz", idle_rz, ua.VariantType.Double, write=set_idle_rz)
+
+        # free or line (MODE), and in line mode the layout's JSON as it was read (LINE_LAYOUT).
+        spec = self.ctl.coordinator.line_spec
+        await self._variable(parent, "Mode", lambda: "line" if spec else "free", ua.VariantType.String)
+        await self._variable(parent, "LineLayout", lambda: spec.text if spec else "", ua.VariantType.String)
 
     async def _shuttle_equipment(self, parent, xid):
         xbot = await parent.add_object(self.idx, "Xbot")

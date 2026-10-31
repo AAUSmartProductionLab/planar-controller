@@ -29,6 +29,11 @@ there with the PMC's own auto routing (gather). With an idle orientation, an xbo
 is turned to it (on a flyway centre: the PMC turns nowhere else, and its auto routing does not
 turn at all), by a task of the coordinator's own that any request replaces.
 
+In line mode (lines.py) the planner plans on the lanes' graph instead of the whole lattice, and
+keeps every xbot off the slots of no lane but the way to and from its own target (and the idle
+area, the loading queue, for the ones nobody holds); turns are made on the turn spots, and there
+is no straight move off the lanes.
+
 Units: metres and radians.
 """
 
@@ -42,6 +47,7 @@ from dataclasses import dataclass, field
 from . import mapf
 from .layout import (ANGLE_TOLERANCE_RAD, EXACT_M, POSITION_TOLERANCE_M, angle_difference, hull,
                      is_square_aligned, overlap, wrap_angle)
+from .lines import LineError, Lines
 from .statemachines import ErrorID
 
 log = logging.getLogger(__name__)
@@ -198,8 +204,12 @@ class Agent:
 
 class Coordinator:
     def __init__(self, driver, lock, clock=time.monotonic, *, plan_timeout=0.5, plan_budget=0.05,
-                 patience_s=None, displace_held=False, loading_station=None, idle_rz=None):
+                 patience_s=None, displace_held=False, loading_station=None, idle_rz=None, line_spec=None):
         self.driver = driver
+        self.line_spec = line_spec  # line mode: the lanes they travel on (see lines.py); None: free
+        self.lines = None          # the line spec on the table, once connected
+        self.graph = None          # the steps the planner may take: {slot: [slots]}
+        self.graph_reverse = None
         self.lock = lock
         self.clock = clock
         self.plan_timeout = plan_timeout
@@ -291,18 +301,40 @@ class Coordinator:
         except DriverError as e:
             log.error("connecting to the PMC: %s", e)
             return e.code
+        lines = None
+        if self.line_spec is not None:
+            try:
+                lines = Lines(self.line_spec, layout)
+            except LineError as e:
+                log.error("the line layout does not fit the table: %s", e)
+                return ErrorID.LINE_LAYOUT_INVALID
         with self.lock:
             self.layout = layout
+            self.lines = lines
+            self.graph = lines.graph if lines else layout.adjacency
+            self.graph_reverse = lines.reverse if lines else layout.adjacency
             # Every xbot on the table takes part, whether it is offered as a shuttle or not.
             for xid in set(readings) | set(xids or ()):
                 self.agents.setdefault(xid, Agent(xid))
             self.connected = True
             self._signature = None
-            self.queue = self._queue_slots() if self.loading_station else []
+            if lines:
+                if self.loading_station:
+                    log.warning("line mode: the loading queue is the line layout's idleArea, not LOADING_STATION")
+                self.queue = list(lines.idle)
+            else:
+                self.queue = self._queue_slots() if self.loading_station else []
             self._update(readings, self.clock())
             log.info("PMC connected: table %dx%d flyways, holes %s, xbots %s", layout.cols, layout.rows,
                      sorted(layout.holes), sorted(readings))
-            log.info("table slots:\n%s", layout.describe())
+            if lines:
+                log.info("line mode, %d lanes, turn spots %s:\n%s", len(lines.lanes),
+                         lines.turn_spots or "any flyway", lines.describe())
+                if len(lines.idle) < len(self.agents):
+                    log.warning("line mode: the idle area has %d slots for %d xbots; the free xbots that do not "
+                                "fit wait where they are, on a lane in the way", len(lines.idle), len(self.agents))
+            else:
+                log.info("table slots:\n%s", layout.describe())
             if self.queue:
                 log.info("loading queue: %s", self.queue[:len(self.agents)])
         return ErrorID.NONE
@@ -650,7 +682,7 @@ class Coordinator:
         if at_target_xy and not turn:
             self._finish(agent, True)
             return
-        if not turn and self._straight(agent, task):
+        if not turn and not self.lines and self._straight(agent, task):  # (in line mode: the lanes)
             return
 
         if agent.cell is None:
@@ -715,8 +747,15 @@ class Coordinator:
         agent.want = agent.cell
         if now - agent.zone_since < CLAIM_YIELD_S:
             return
-        if any(o is not agent and o.zone_boxes and not o.in_macro and o.zone_since < agent.zone_since
-               for o in self.agents.values()):
+        if self.lines:
+            # On lanes the ones in its way may have no way out while it stays put: let go, so the
+            # planner may move it too, and claim again later.
+            log.info("xbot %d: its claim did not clear in %.0f s; lets go of it for now", agent.xid, CLAIM_YIELD_S)
+            agent.zone, agent.zone_boxes = None, ()
+            agent.task.flyway = None
+            agent.task.claim_after = now + CLAIM_YIELD_S
+        elif any(o is not agent and o.zone_boxes and not o.in_macro and o.zone_since < agent.zone_since
+                 for o in self.agents.values()):
             log.info("xbot %d: gives way to an older claim", agent.xid)
             agent.zone, agent.zone_boxes = None, ()
             agent.task.flyway = None
@@ -961,11 +1000,11 @@ class Coordinator:
                         return False
                 if any(a.to in cells for a in other.actions):
                     return False  # planned to come through: let the plan go first
-        if not immediate and waiting:
-            if agent.task is not None and self.clock() < agent.task.claim_after:
-                return False  # it gave way: the older claim first
-            if not self._room_to_clear(agent, cells):
-                return False
+        if (not immediate and (waiting or self.lines) and agent.task is not None
+                and self.clock() < agent.task.claim_after):
+            return False  # it gave way (to the older claim, or in line mode to the ones in its way)
+        if not immediate and (waiting or self.lines) and not self._room_to_clear(agent, cells):
+            return False
         agent.zone_boxes = boxes
         agent.zone = cells
         if not immediate:
@@ -984,12 +1023,16 @@ class Coordinator:
         movers = [m for m in self.agents.values() if self._is_mover(m)]
         if len(outside) < sum(1 for m in movers if m.start not in zones.get(m.xid, ())):
             return False
+        if self.lines:  # the claimers stay where they are while they wait (see _plan)
+            open_cells -= {o.start for o in movers if o.xid in zones and o.start is not None}
         for m in movers:
             start = m.start
             if start not in claimed or start in zones.get(m.xid, ()):
                 continue
             # As the planner sees it: it may cross the claims it stands in, not the others.
             passable = open_cells - frozenset().union(*[z for z in zones.values() if start not in z])
+            if self.lines:
+                passable -= self.lines.keep_out([start, m.want], idle=m.task is None)
             if not outside & self._steps_from(start, passable).keys():
                 return False
         return True
@@ -1042,16 +1085,18 @@ class Coordinator:
         return walls
 
     def _static_distance(self, agent, cell, toward):
-        """Steps from cell to the nearest of toward, around walls only."""
+        """Steps from cell to the nearest of toward, around walls only (in line mode: on the lanes)."""
         free = self.layout.cells - self._walls(exclude=agent)
         toward = set(toward)
         if cell in toward:
             return 0
+        if self.lines:
+            free -= self.lines.keep_out([cell, *toward], idle=agent.task is None)
         seen = {cell}
         queue = deque([(cell, 0)])
         while queue:
             v, d = queue.popleft()
-            for u in self.layout.adjacency[v]:
+            for u in self.graph[v]:
                 if u in seen or u not in free:
                     continue
                 if u in toward:
@@ -1070,7 +1115,7 @@ class Coordinator:
                    if o is not agent and self._is_wall(o)]
         blocked += self._claims(agent)
         target_cells = self._target_cells(task)
-        candidates = self.layout.flyways
+        candidates = (self.lines.turn_spots if self.lines and self.lines.turn_spots else self.layout.flyways)
         if not is_square_aligned(task.target.rz):
             # It may not travel turned like that: it turns on the target's own flyway.
             candidates = [self.layout.flyway_at(task.target.x, task.target.y, EXACT_M)]
@@ -1134,6 +1179,18 @@ class Coordinator:
         claimed = {a.xid: frozenset().union(*[z for x, z in zones.items() if x != a.xid]) for a in movers}
         keep_out = {a.xid: frozenset().union(*[z for x, z in zones.items() if x != a.xid and start[a.xid] not in z])
                     for a in movers}
+        passable = cells
+        if self.lines:
+            # Line mode: the lanes, and off them only the way from where it is and to where it goes
+            # (one nobody holds: and the idle area).
+            for a in movers:
+                own = [start[a.xid], a.want] if a.task else [start[a.xid], None if self.queue else a.home]
+                keep_out[a.xid] |= self.lines.keep_out(own, idle=a.task is None)
+                if a.zone:
+                    # Waiting for its claim to clear, it stays put: pushed off along a one-way
+                    # lane it would have to go all the way round, its claim blocking the lane.
+                    keep_out[a.xid] = self.layout.cells - {start[a.xid]}
+            passable = cells - self.lines.keep_out(list(start.values()), idle=True)
 
         goals = {}
         taken = set()
@@ -1142,7 +1199,8 @@ class Coordinator:
             agent.desired = want
             here, free = start[agent.xid], cells - keep_out[agent.xid]
             usable = cells - claimed[agent.xid] - taken
-            if want is None or want not in usable or not self._reachable(here, want, free):
+            if (want is None or want not in usable or (want not in free and want != here)
+                    or not self._reachable(here, want, free)):
                 if agent.task is not None and want is not None:
                     log.debug("xbot %d: waits, %s is not free", agent.xid, want)
                 want = self._closest_free(here, want or here, usable, free)
@@ -1156,13 +1214,24 @@ class Coordinator:
             goals[agent.xid] = want
             taken.add(want)
 
+        # In line mode, one standing in another's claim first goes to the nearest slot out of it it
+        # can get to past the others (on a lane one wide the way to its own target may need others
+        # to pass each other, which they cannot while the claim blocks the lane).
+        leaving_claims = set()
+        if self.lines:
+            for agent in movers:
+                way_out = self._way_out(agent, start, cells - keep_out[agent.xid], claimed[agent.xid] | taken)
+                if way_out is not None:
+                    settle(agent, way_out)
+                    leaving_claims.add(agent.xid)
         # Xbots with a task first, the longest waiting first; then the idle ones: into the loading
         # queue if there is one, else back where they were.
-        idle = [a for a in movers if a.task is None]
-        for agent in sorted((a for a in movers if a.task), key=lambda a: a.task.seq):
+        rest = [a for a in movers if a.xid not in leaving_claims]
+        idle = [a for a in rest if a.task is None]
+        for agent in sorted((a for a in rest if a.task), key=lambda a: a.task.seq):
             settle(agent, agent.want)
         if self.queue:
-            for agent, slot in self._line_up(idle, start, cells - taken - frozenset().union(*zones.values()), cells):
+            for agent, slot in self._line_up(idle, start, cells - taken - frozenset().union(*zones.values()), passable):
                 settle(agent, slot)
         else:
             for agent in idle:
@@ -1172,7 +1241,7 @@ class Coordinator:
 
         order = [a.xid for a in movers]
         try:
-            instance = mapf.Instance(cells, self.layout.adjacency,
+            instance = mapf.Instance(cells, self.graph,
                                      [start[x] for x in order], [goals[x] for x in order],
                                      keep_out=[keep_out[x] for x in order])
         except ValueError as e:
@@ -1204,33 +1273,54 @@ class Coordinator:
                 break
             if slot not in usable:
                 continue
-            steps = self._steps_from(slot, passable)
+            steps = self._steps_from(slot, passable, reverse=True)  # from the xbots to the slot
             reach = [x for x in left if start[x] in steps]
             if reach:
                 xid = min(reach, key=lambda x: (steps[start[x]], start[x] in needed, x))
                 out.append((left.pop(xid), slot))
         return out + [(a, start[a.xid]) for a in left.values()]
 
-    def _steps_from(self, origin, passable):
+    def _way_out(self, agent, start, free, claimed):
+        """For one standing in a claim not its own: the nearest free slot out of the claims that
+        it can get to without passing another xbot; None if it stands in none (or there is none)."""
+        here = start[agent.xid]
+        if here not in claimed:
+            return None
+        others = {s for x, s in start.items() if x != agent.xid}
+        seen = {here}
+        queue = deque([here])
+        while queue:
+            v = queue.popleft()
+            for u in self.graph[v]:
+                if u in seen or u not in free or u in others:
+                    continue
+                if u not in claimed:
+                    return u
+                seen.add(u)
+                queue.append(u)
+        return None
+
+    def _steps_from(self, origin, passable, reverse=False):
+        """Steps from origin to every slot it can reach across passable ones (reverse: to origin)."""
+        graph = self.graph_reverse if reverse else self.graph
         steps = {origin: 0}
         queue = deque([origin])
         while queue:
             v = queue.popleft()
-            for u in self.layout.adjacency[v]:
+            for u in graph[v]:
                 if u in passable and u not in steps:
                     steps[u] = steps[v] + 1
                     queue.append(u)
         return steps
 
-    @staticmethod
-    def _reachable(start, goal, free):
+    def _reachable(self, start, goal, free):
         if start == goal:
             return True
         seen = {start}
         queue = deque([start])
         while queue:
             v = queue.popleft()
-            for u in ((v[0] + 1, v[1]), (v[0] - 1, v[1]), (v[0], v[1] + 1), (v[0], v[1] - 1)):
+            for u in self.graph[v]:
                 if u == goal:
                     return True
                 if u in free and u not in seen:
@@ -1244,7 +1334,7 @@ class Coordinator:
         queue = deque([start])
         while queue:
             v = queue.popleft()
-            for u in self.layout.adjacency[v]:
+            for u in self.graph[v]:
                 if u in free and u not in reach:
                     reach.add(u)
                     queue.append(u)

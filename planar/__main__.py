@@ -14,6 +14,10 @@ Environment (each also an option, see --help):
   IDLE_RZ         degrees, a multiple of 90: the xbots nobody holds are turned to it, and the
                   table's Reset turns every shuttle to it (empty: as they are); also
                   PlanarTable/Equipment/IdleRz over OPC UA
+  MODE            free (the default): the xbots may travel anywhere on the table; line: only
+                  on the lanes of LINE_LAYOUT (see planar/lines.py)
+  LINE_LAYOUT     line mode: the layout's JSON file, or an http(s) URL to fetch it from (e.g.
+                  an AAS submodel element's file); its idleArea is the loading queue
   XBOT_SPEED      m/s (0.5), XBOT_ACCEL m/s^2 (2.0)
   LOG_LEVEL       INFO
 """
@@ -24,6 +28,7 @@ import logging
 import math
 import os
 
+from . import lines
 from .coordinator import DriverError
 from .modules import PlanarController
 from .opcua_server import OpcUaServer
@@ -72,10 +77,15 @@ def parse_args():
     p.add_argument("--blocked-timeout", type=float, default=float(os.environ.get("BLOCKED_TIMEOUT_S", 0) or 0))
     p.add_argument("--loading-station", type=_point_mm, metavar="X,Y", default=os.environ.get("LOADING_STATION", ""))
     p.add_argument("--idle-rz", type=_quarter_deg, metavar="DEG", default=os.environ.get("IDLE_RZ", ""))
+    p.add_argument("--mode", choices=("free", "line"), default=os.environ.get("MODE", "").strip().lower() or "free")
+    p.add_argument("--line-layout", metavar="FILE|URL", default=os.environ.get("LINE_LAYOUT", "").strip())
     p.add_argument("--speed", type=float, default=float(os.environ.get("XBOT_SPEED", 0.5)))
     p.add_argument("--accel", type=float, default=float(os.environ.get("XBOT_ACCEL", 2.0)))
     p.add_argument("--log-level", default=os.environ.get("LOG_LEVEL", "INFO"))
-    return p.parse_args()
+    args = p.parse_args()
+    if args.mode not in ("free", "line"):  # from MODE: argparse checks only what is given on the command line
+        p.error(f"MODE is free or line, not {args.mode!r}")
+    return args
 
 
 async def detect(driver):
@@ -89,6 +99,23 @@ async def detect(driver):
             continue
         log.info("xbots on the PMC: %s", shuttles)
         return shuttles
+
+
+async def line_layout(source, retry_s=10.0):
+    """The line layout; from a URL it waits for the server rather than giving up."""
+    while True:
+        try:
+            spec = await asyncio.to_thread(lines.load, source)
+        except lines.LineError as e:
+            raise SystemExit(f"LINE_LAYOUT {source}: {e}") from None
+        except OSError as e:
+            if not source.startswith(("http://", "https://")):
+                raise SystemExit(f"LINE_LAYOUT {source}: {e}") from None
+            log.warning("waiting for the line layout from %s: %s", source, e)
+            await asyncio.sleep(retry_s)
+            continue
+        log.info("line mode: %d lanes from %s", len(spec.lanes), source)
+        return spec
 
 
 async def autostart(ctl, retry_s=10.0):
@@ -117,6 +144,13 @@ async def main():
     args = parse_args()
     logging.basicConfig(level=args.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("asyncua").setLevel(logging.WARNING)  # it logs every request at INFO
+    line_spec = None
+    if args.mode == "line":
+        if not args.line_layout:
+            raise SystemExit("MODE=line needs LINE_LAYOUT (a JSON file or URL)")
+        line_spec = await line_layout(args.line_layout)
+    elif args.line_layout:
+        log.warning("LINE_LAYOUT is set but MODE is free: the lanes are not used")
     driver = PmcDriver(args.pmc_ip, speed=args.speed, accel=args.accel)
     if args.shuttles.strip():
         shuttles = [int(x) for x in args.shuttles.replace(" ", "").split(",") if x]
@@ -124,7 +158,7 @@ async def main():
         shuttles = await detect(driver)
     ctl = PlanarController(driver, shuttles, displace_held=args.displace_held,
                            patience_s=args.blocked_timeout or None, loading_station=args.loading_station,
-                           idle_rz=args.idle_rz)
+                           idle_rz=args.idle_rz, line_spec=line_spec)
     server = OpcUaServer(ctl, args.endpoint)
     await server.init()
     ctl.start()

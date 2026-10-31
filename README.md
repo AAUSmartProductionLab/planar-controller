@@ -31,6 +31,7 @@ cd planar-controller
 | `--shuttles LIST` | the xbot ids to offer, e.g. `1,2,3` (empty: the ones the PMC knows) |
 | `--loading-station X,Y` | in mm: free xbots queue up there, and a Reset sends them there (`LOADING_STATION`) |
 | `--idle-rz DEG` | a multiple of 90: free xbots are turned to it, and a Reset turns them all (`IDLE_RZ`) |
+| `--mode free\|line`, `--line-layout FILE\|URL` | anywhere on the table, or only on the lanes of a line layout (`MODE`, `LINE_LAYOUT`; see [Line mode](#line-mode)) |
 | `--autostart` / `--no-autostart` | Reset and Start the table when the controller starts, or leave it Stopped (the default) |
 | `--dir DIR` | where to clone it when not run from a clone (`~/planar-controller`) |
 | `--branch NAME` | the branch to install (`main`) |
@@ -60,6 +61,8 @@ docker compose down              # stop
 | `BLOCKED_TIMEOUT_S` | `0` | seconds a move may wait without getting closer before it fails with Blocked (20); `0`: it waits until the way is free or it is stopped |
 | `LOADING_STATION` | empty | `X,Y` in mm, e.g. `60,180`: the xbots nobody holds queue up there, and the table's Reset sends them there (see below); empty: an xbot nobody holds stays where it was |
 | `IDLE_RZ` | empty | degrees, a multiple of 90, e.g. `0`: the xbots nobody holds are turned to it, and the table's Reset turns every shuttle to it; empty: as they are. Also `PlanarTable/Equipment/IdleRz` over OPC UA |
+| `MODE` | `free` | `free`: the xbots may travel anywhere on the table; `line`: only on the lanes of `LINE_LAYOUT` (see [Line mode](#line-mode)) |
+| `LINE_LAYOUT` | empty | line mode: the layout, a file in `config/` (e.g. `config/line-layout.json`) or an `http(s)://` URL to fetch it from at start-up |
 | `XBOT_SPEED`, `XBOT_ACCEL` | `0.5`, `2.0` | m/s, m/s² |
 | `LOG_LEVEL` | `INFO` | |
 
@@ -93,6 +96,7 @@ Namespace `urn:aau:smartproductionlab:planar`. Modules: `PlanarTable` and `Plana
 | `Equipment/PMC/Connected`, `Columns`, `Rows`, `FlywaySize`, `Holes` | the table: the PMC's connection and the layout it reports (flyways of `FlywaySize` mm in `Columns` by `Rows`, without the `Holes`, given as `"<column>,<row>"` apart by spaces; 0 and empty until connected) |
 | `Equipment/LoadingQueue` | the table: the free shuttles waiting at the loading station (and turned to `IdleRz`), the one on it first, apart by spaces (e.g. `"PlanarShuttle3 PlanarShuttle1"`): the one to occupy for the next product; empty without `LOADING_STATION` |
 | `Equipment/IdleRz` | the table, writable: the orientation in degrees free shuttles are turned to, a multiple of 90; NaN: as they are. Another value is not taken and reads back as it was. Starts as `IDLE_RZ` |
+| `Equipment/Mode`, `Equipment/LineLayout` | the table: `free` or `line`, and in line mode the layout's JSON as it was read (empty in free mode) |
 
 Every method answers `[Accepted, ErrorID]` at once. An accepted `MoveToPosition` finishes when
 the xbot has arrived: its `State` turns Succeeded (3), and Failed (4) with an `ErrorID` if it
@@ -140,6 +144,7 @@ its ErrorID in `ErrorID` next to its `State`.
 | 28 | XbotNotDetected | the PMC does not report this xbot (missing or landed) |
 | 29 | XbotCrooked | the xbot is turned off the axes away from a flyway centre and cannot travel |
 | 30 | MotionDeviated | a move ended somewhere else than it was sent |
+| 31 | LineLayoutInvalid | line mode: the table's Resetting found that the line layout does not fit the table (the log says why) |
 
 A typical run: `PlanarTable/Module/Reset`, wait for Idle, `Start`; then per product
 `PlanarShuttle1/Occupation/Occupy(id)`, `Skills/MoveToPosition/Start(id, x, y, rz)`, wait for
@@ -151,7 +156,7 @@ State 3, ... , `Release(id)`.
   covers that slot; anywhere else (a station pose between slots, a flyway centre) it covers every
   slot it overlaps, and others go around.
 - A move whose straight line is free (nothing in the box it sweeps, at most 16 slots) is one
-  straight move, slots or not.
+  straight move, slots or not (not in line mode: there it keeps to the lanes).
 - Otherwise all xbots move as one plan (`planar/mapf.py`: LaCAM with PIBT). It finds a way
   whenever there is one, including two xbots passing each other in a one-lane passage by way of
   a pocket, and pushes idle xbots out of the way. Once it has a plan it tries more for up to
@@ -185,6 +190,66 @@ State 3, ... , `Release(id)`.
   and leaves the same way.
 - An unoccupied xbot left off the slots steps back onto the nearest one.
 
+## Line mode
+
+With `MODE=line` the xbots travel only on lanes you lay out, so the way between two places is
+always the same one, and they turn only on the turn spots. The layout is JSON, in mm in the
+table's coordinates (the same as the skill's X and Y; slot centres are at 60, 180, 300, ...):
+
+```json
+{
+  "lanes": [
+    {"name": "loop", "points": [[180, 180], [780, 180], [780, 540], [180, 540], [180, 180]], "oneWay": true},
+    {"name": "shortcut", "points": [[420, 180], [420, 540]]}
+  ],
+  "turnSpots": [[840, 360]],
+  "idleArea": [[60, 180], [60, 540]]
+}
+```
+
+On the 4 x 3 table that is (the controller logs it like this; top row first):
+
+```
+########     > < ^ v  a one-way lane, the way on
+Iv<+<<<#     +        a two-way lane, or where lanes cross
+Iv#+##^T     I        the idle area
+Iv#+##^T     T        a turn spot's flyway
+I>>+>>^#     #        a slot of no lane
+########
+```
+
+- **lanes**: each a line through slot centres, every stretch along a row or a column. A one-way
+  lane (`"oneWay": true`) is driven from its first point to its last, the others both ways. Where
+  lanes meet or cross an xbot may change from one to the other; between two lane slots side by
+  side there is no way but along a lane. The lanes together must lead from every lane slot to
+  every other (with one-way lanes too), or the table's Reset fails with ErrorID 31.
+- **Targets off the lanes** (a station beside them) are reached from the nearest lane slot, the
+  shortest way across slots of no lane, and left the same way; only the xbot going there or
+  coming from there drives on those slots. Keep stations off the lanes: a shuttle held at a
+  station on a lane blocks the lane until it is released.
+- **turnSpots**: points in the flyways xbots turn on (a turn claims the whole flyway, so a turn
+  spot on a lane blocks it while the xbot turns); none: any flyway. A target turned off the axes
+  is still turned on its own flyway.
+- **idleArea**: a line like a lane's: the loading queue in order, its first point the loading
+  position (`LOADING_STATION` is not used). The xbots nobody holds wait there, reached and left
+  like a target off the lanes. Without it, an idle xbot goes back to where it was. Give it a slot
+  for every xbot on the table: a free xbot that does not fit waits where it is, and on a one-way
+  lane that soon blocks the others (the controller warns at the Reset when it is too small).
+- An idle xbot nobody holds is pushed only along the lanes; one waiting for its turn spot or
+  station to clear stays where it is (for up to 5 s, then it lets go of its claim for a while, so
+  the ones in its way can get out).
+- Laying out lanes: xbots on a lane one slot wide cannot pass each other, so two-way lanes jam
+  as soon as several xbots go opposite ways on them (in the simulated tests, 8 xbots on a single
+  two-way lane mostly do). Prefer one-way loops, with two-way lanes only as short branches, and
+  put turn spots where a waiting xbot does not stand in the others' way.
+- The table's Reset still sends the shuttles into the queue with the PMC's auto routing, which
+  knows nothing of the lanes; the lanes apply from then on.
+- `LINE_LAYOUT` is read once at start-up. From a URL the controller waits for the server while it
+  cannot be reached; a layout that is not valid JSON, or not a layout, stops it with the reason.
+  A JSON string holding the layout is read too, so it can be the `$value` of an AAS `Property`,
+  or the content of an AAS `File` element (its `/attachment`). `config/line-layout.example.json`
+  is the layout above; `config/` is mounted into the container.
+
 ## Development
 
 | | |
@@ -193,6 +258,7 @@ State 3, ... , `Release(id)`.
 | `planar/modules.py` | the table and shuttle modules on the coordinator |
 | `planar/coordinator.py` | turns tasks into plans and plans into motions |
 | `planar/mapf.py` | the multi-xbot planner |
+| `planar/lines.py` | line mode: the layout, its slot graph and who may use which slots |
 | `planar/layout.py` | the table: flyways, holes, slots, footprints, boxes |
 | `planar/pmc_driver.py`, `planar/sim_driver.py` | pmclib, and a kinematic stand-in for tests |
 | `planar/opcua_server.py` | the OPC UA address space |
@@ -200,7 +266,7 @@ State 3, ... , `Release(id)`.
 
 ```bash
 pip install -r requirements.txt dependencies/pmclib-117.9.1-py3-none-any.whl pytest
-python -m pytest tests                    # no PMC needed; about 90 s
+python -m pytest tests                    # no PMC needed; about 3 minutes
 python tests/stress_contention.py 40      # 480 runs: many xbots, one place, in order, no collisions
 ```
 
@@ -215,6 +281,11 @@ controller and the PMC (or its simulation tool):
 ```bash
 python tests/line_scenario.py --endpoint opc.tcp://127.0.0.1:4840/ --agents 3 --products 3 --fail 0.2
 ```
+
+On a Windows PC with Planar Motor's simulation tool installed, `tools/pmc-sim.ps1 start|stop|restart|status`
+runs its PMC (`Dlls\VirtualPMC.exe`) without the tool's window, for `PMC_IP=127.0.0.1`. The tool is
+not commercially available and not in this repository; the script runs it from where it is
+installed (or `PMC_SIM_DIR`, or a copy in `pmc-sim/`, which git and Docker ignore).
 
 pmclib is Planar Motor's and not on PyPI; the wheel is in `dependencies/`. 117.9.1 works with PMC
 firmware 117.17.35 and later. 117.15.01 (May 2026) needs firmware 117.26.45 and adds nothing this

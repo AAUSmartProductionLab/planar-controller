@@ -35,14 +35,18 @@ class Instance:
     """
     One planning problem.
 
-    cells: the cells the xbots may use; adjacency: their neighbours (within cells);
-    starts, goals: one cell each per xbot; keep_out: per xbot, cells it may not enter (it may
-    leave one it starts in).
+    cells: the cells the xbots may use; adjacency: the cells each may be left for (within cells;
+    one way only on a one-way lane); starts, goals: one cell each per xbot; keep_out: per xbot,
+    cells it may not enter (it may leave one it starts in).
     """
 
     def __init__(self, cells, adjacency, starts, goals, keep_out=None):
         self.cells = frozenset(cells)
         self.adj = {c: [d for d in adjacency[c] if d in self.cells] for c in self.cells}
+        self.radj = {c: [] for c in self.cells}  # the cells each may be reached from
+        for c in sorted(self.cells):
+            for d in self.adj[c]:
+                self.radj[d].append(c)
         self.starts = tuple(starts)
         self.goals = tuple(goals)
         self.n = len(self.starts)
@@ -60,7 +64,7 @@ class Instance:
         queue = deque([goal])
         while queue:
             v = queue.popleft()
-            for u in self.adj[v]:
+            for u in self.radj[v]:
                 if u not in dist and u not in keep_out:
                     dist[u] = dist[v] + 1
                     queue.append(u)
@@ -79,6 +83,12 @@ class Instance:
 
     def reachable(self, i):
         return self.dist(i, self.starts[i]) < INF
+
+    def successors(self, i, cell):
+        """Where it may be one step on from cell: there still, or a neighbour it may enter and
+        can still reach its goal from (on a one-way lane a step may lead where it never can, and
+        no plan goes through that)."""
+        return [cell] + [v for v in self.adj[cell] if self.may_enter(i, v) and self.dist(i, v) < INF]
 
 
 def valid_step(instance, q_from, q_to):
@@ -130,7 +140,7 @@ class _Pibt:
 
         def plan(i, ancestors):
             here = q_from[i]
-            candidates = [here] + [v for v in inst.adj[here] if inst.may_enter(i, v)]
+            candidates = inst.successors(i, here)
             self.rng.shuffle(candidates)
             # Nearer the goal first; between equally near ones, on in the direction it came: of
             # the shortest paths, the straight ones (one corner instead of a staircase).
@@ -245,8 +255,7 @@ def lacam(instance, timeout=0.5, seed=0):
         constraint = node.tree.popleft()
         if constraint.depth < inst.n:
             i = node.order[constraint.depth]
-            here = node.config[i]
-            successors = [here] + [v for v in inst.adj[here] if inst.may_enter(i, v)]
+            successors = inst.successors(i, node.config[i])
             rng.shuffle(successors)
             for v in successors:
                 node.tree.append(_Constraint(constraint, i, v, constraint.depth + 1))

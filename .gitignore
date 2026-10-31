@@ -218,3 +218,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Planar Motor's simulation tool, if copied here for tools/pmc-sim.ps1: not to be shared
+/pmc-sim/

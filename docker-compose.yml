@@ -25,9 +25,13 @@ services:
       BLOCKED_TIMEOUT_S: ${BLOCKED_TIMEOUT_S:-0}
       LOADING_STATION: ${LOADING_STATION:-}
       IDLE_RZ: ${IDLE_RZ:-}
+      MODE: ${MODE:-free}
+      LINE_LAYOUT: ${LINE_LAYOUT:-}
       XBOT_SPEED: ${XBOT_SPEED:-0.5}
       XBOT_ACCEL: ${XBOT_ACCEL:-2.0}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./config:/app/config:ro  # the line layout file (LINE_LAYOUT=config/...)
     logging:
       driver: json-file
       options:
