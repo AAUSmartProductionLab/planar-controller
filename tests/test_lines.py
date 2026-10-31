@@ -99,6 +99,9 @@ def test_what_is_no_layout_says_why(layout, message):
     ({"lanes": [{"points": [[60, 60], [900, 60]], "oneWay": True}]}, TABLE, "lead nowhere"),
     ({"lanes": [{"points": [[60, 60], [900, 60]]}, {"points": [[60, 180], [900, 180]]}]}, TABLE, "lead nowhere"),
     ({"lanes": [{"points": [[60, 60], [900, 60]]}], "turnSpots": [[1000, 60]]}, TABLE, "not on a flyway"),
+    ({"lanes": [{"points": [[60, 180], [900, 180]]}], "turnSpots": [[240, 120]]}, TABLE, "between flyways"),
+    ({"lanes": [{"points": [[60, 180], [900, 180]]}], "turnSpots": [[480, 240]]}, HOLED, "between flyways"),
+    ({"lanes": [{"points": [[60, 60], [900, 60]]}], "turnSpots": [[600, 600]]}, TABLE, "no lane slot under it"),
     ({"lanes": [{"points": [[60, 60], [900, 60]]}], "idleArea": [[60, 180], [180, 180], [60, 180]]}, TABLE,
      "passes a slot twice"),
 ])
@@ -121,8 +124,17 @@ def test_lanes_are_driven_only_along_them_and_one_way_lanes_only_forward():
     assert set(ln.graph[(3, 2)]) == {(3, 1), (3, 3), (2, 2), (4, 2)}  # two-way, and off the lanes
     assert (1, 1) in ln.graph[(0, 1)] and (0, 1) in ln.graph[(1, 1)]  # off a lane: both ways
     assert ln.idle == [(0, 1), (0, 2), (0, 3), (0, 4)]
-    assert ln.turn_spots == [(3, 1)]
+    assert ln.turn_spots == [pytest.approx((0.84, 0.36))]  # flyway (3, 1)'s centre
     assert ln.describe().splitlines() == ["########", "Iv<+<<<#", "Iv#+##^T", "Iv#+##^T", "I>>+>>^#", "########"]
+
+
+def test_a_turn_spot_may_be_where_four_flyways_meet():
+    ln = lines({**LOOP, "turnSpots": [[720, 480], [820, 400]]})
+    assert ln.turn_spots == [pytest.approx((0.72, 0.48)), pytest.approx((0.84, 0.36))]  # the second: its flyway's centre
+    assert TABLE.spot_cells(ln.turn_spots[0]) == {(5, 3), (6, 3), (5, 4), (6, 4)}
+    mm = lambda spots: [(round(x * 1000), round(y * 1000)) for x, y in spots]
+    assert mm(TABLE.junctions) == [(240, 240), (240, 480), (480, 240), (480, 480), (720, 240), (720, 480)]
+    assert mm(HOLED.junctions) == [(240, 240), (240, 480)]  # the hole at (2, 1) touches the other four
 
 
 def test_a_slot_off_the_lanes_is_reached_the_shortest_way_from_the_nearest_lane_slot():
@@ -152,6 +164,41 @@ def test_a_station_off_the_lanes_is_reached_from_the_nearest_lane_slot_and_turne
     assert set(path) <= h.lines.lane_cells | {(6, 0), (7, 0)} | TABLE.flyway_cells((3, 1))
     assert [cmd for cmd in h.sim.commands if cmd[2] == "rotate"], "turned"
     assert h.covered <= h.lines.lane_cells | {(6, 0), (7, 0)} | TABLE.flyway_cells((3, 1))
+    assert not h.sim.collisions
+
+
+def _spy_turns(h):
+    """Where each rotation is made: [(xid, (x mm, y mm))]."""
+    turns = []
+    rotate = h.sim.rotate
+
+    def spy(xid, rz):
+        xb = h.sim.xbots[xid]
+        turns.append((xid, (round(xb.x * 1000), round(xb.y * 1000))))
+        return rotate(xid, rz)
+    h.sim.rotate = spy
+    return turns
+
+
+def test_an_xbot_turns_where_four_flyways_meet():
+    h = Harness({1: (1, 1)}, layout={**LOOP, "turnSpots": [[720, 480]]})
+    turns = _spy_turns(h)
+    assert h.go(1, (2, 5), rz_deg=90)
+    assert turns == [(1, (720, 480))]
+    assert not h.sim.collisions
+
+
+def test_xbots_wait_for_the_turn_spot_nearest_to_them_rather_than_drive_on_to_another():
+    # Two turn spots on the loop: (840, 360) on its right side, met first from the bottom, and
+    # (600, 600) on its top. All three turn on the first, one after the other.
+    h = Harness({1: (5, 1), 2: (4, 1), 3: (3, 1)}, layout={**LOOP, "turnSpots": [[840, 360], [600, 600]]})
+    turns = _spy_turns(h)
+    done = []
+    with h.lock:
+        for xid, cell in ((1, (3, 5)), (2, (2, 5)), (3, (1, 5))):
+            h.coord.submit(xid, Pose(*c(*cell), math.radians(90)), lambda ok, e, r: done.append(ok))
+    assert h.run(120, lambda: len(done) == 3) and all(done)
+    assert sorted(turns) == [(1, (840, 360)), (2, (840, 360)), (3, (840, 360))]
     assert not h.sim.collisions
 
 

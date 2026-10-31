@@ -20,8 +20,11 @@ The layout is JSON, in mm in the table's coordinates (as the skill's X and Y):
 - A target off the lanes (a station beside them) is reached from the lane slot nearest to it,
   the shortest way across slots of no lane, and left the same way. Only the xbot going there or
   coming from there drives on those slots.
-- turnSpots: points in the flyways xbots turn on (the PMC turns an xbot only on a flyway centre);
-  none: any flyway. A target turned off the axes is still turned on its own flyway.
+- turnSpots: the points xbots turn on, each a flyway's centre or a point where four flyways meet
+  (the PMC turns an xbot nowhere else; another point in a flyway stands for its centre), with a
+  lane slot under it. An xbot turns on the one nearest to it along the lanes, and waits there
+  while another turns on it; none: any flyway centre. A target turned off the axes is still turned
+  on its own spot.
 - idleArea: a line like a lane's: the loading queue in order, its first point the loading
   position. The free xbots wait there, reached and left like a target off the lanes.
 
@@ -34,6 +37,10 @@ import math
 import urllib.request
 from collections import deque
 from dataclasses import dataclass
+
+
+# A point of the layout is on a spot or a flyway border this close (the points are in whole mm).
+POINT_TOLERANCE_M = 0.0005
 
 
 class LineError(ValueError):
@@ -128,7 +135,7 @@ class Lines:
         self.idle = self._trace(spec.idle_area, "idleArea") if spec.idle_area else []
         if len(set(self.idle)) != len(self.idle):
             raise LineError("idleArea: passes a slot twice")
-        self.turn_spots = [self._flyway(p) for p in spec.turn_spots]
+        self.turn_spots = [self._spot(p) for p in spec.turn_spots]
         self.graph = self._graph()
         self.reverse = {c: [] for c in self.graph}
         for c, out in self.graph.items():
@@ -163,12 +170,21 @@ class Lines:
                 cells.append(c)
         return cells
 
-    def _flyway(self, point):
-        fs = self.layout.flyway_size
-        flyway = (math.floor(point[0] / fs), math.floor(point[1] / fs))
-        if flyway not in self.layout.flyways:
-            raise LineError(f"turnSpots: ({point[0] * 1000:g}, {point[1] * 1000:g}) mm is not on a flyway")
-        return flyway
+    def _spot(self, point):
+        layout = self.layout
+        where = f"turnSpots: ({point[0] * 1000:g}, {point[1] * 1000:g}) mm"
+        spot = layout.spot_at(*point)
+        if spot is None:
+            fs = layout.flyway_size
+            if any(abs(v - round(v / fs) * fs) < POINT_TOLERANCE_M for v in point):
+                raise LineError(f"{where} is between flyways: a turn spot is a flyway's centre or where four flyways meet")
+            flyway = (math.floor(point[0] / fs), math.floor(point[1] / fs))
+            if flyway not in layout.flyways:
+                raise LineError(f"{where} is not on a flyway")
+            spot = layout.flyway_center(flyway)
+        if not layout.spot_cells(spot) & self.lane_cells:
+            raise LineError(f"{where} has no lane slot under it")
+        return spot
 
     def _graph(self):
         """Between two lane slots only along a lane (and only forward on a one-way one); any other
@@ -250,8 +266,8 @@ class Lines:
                 marks[c] = mark if marks.get(c, mark) == mark else "+"
         for c in self.idle:
             marks.setdefault(c, "I")
-        for flyway in self.turn_spots:
-            for c in self.layout.flyway_cells(flyway):
+        for spot in self.turn_spots:
+            for c in self.layout.spot_cells(spot):
                 marks.setdefault(c, "T")
         rows = []
         for j in reversed(range(self.layout.rows * n)):

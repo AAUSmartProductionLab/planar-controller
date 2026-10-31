@@ -213,7 +213,7 @@ On the 4 x 3 table that is (the controller logs it like this; top row first):
 ########     > < ^ v  a one-way lane, the way on
 Iv<+<<<#     +        a two-way lane, or where lanes cross
 Iv#+##^T     I        the idle area
-Iv#+##^T     T        a turn spot's flyway
+Iv#+##^T     T        what a turn on a turn spot sweeps
 I>>+>>^#     #        a slot of no lane
 ########
 ```
@@ -227,9 +227,13 @@ I>>+>>^#     #        a slot of no lane
   shortest way across slots of no lane, and left the same way; only the xbot going there or
   coming from there drives on those slots. Keep stations off the lanes: a shuttle held at a
   station on a lane blocks the lane until it is released.
-- **turnSpots**: points in the flyways xbots turn on (a turn claims the whole flyway, so a turn
-  spot on a lane blocks it while the xbot turns); none: any flyway. A target turned off the axes
-  is still turned on its own flyway.
+- **turnSpots**: the points xbots turn on, each a flyway's centre or a point where four flyways
+  meet, e.g. `[720, 480]` (the PMC turns an xbot nowhere else; another point in a flyway stands
+  for its centre). A turn claims the square one flyway wide around the spot, so a turn spot on a
+  lane blocks it while the xbot turns, and it must have a lane slot under it. An xbot turns on the
+  turn spot nearest to it along the lanes and, while another turns there, waits behind it rather
+  than drive on to another. None: any flyway centre, whichever is free. A target turned off the
+  axes is still turned on its own spot.
 - **idleArea**: a line like a lane's: the loading queue in order, its first point the loading
   position (`LOADING_STATION` is not used). The xbots nobody holds wait there, reached and left
   like a target off the lanes. Without it, an idle xbot goes back to where it was. Give it a slot

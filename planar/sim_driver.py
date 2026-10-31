@@ -2,7 +2,7 @@
 A kinematic stand-in for the PMC, for testing the coordinator without one.
 
 Xbots move in straight lines with a trapezoidal speed profile and rotate only at flyway centres
-(the PMC refuses rotation anywhere else). The PMC's auto routing is stood in for by the slot
+and where four flyways meet (the PMC refuses rotation anywhere else). The PMC's auto routing is stood in for by the slot
 planner, every xbot stepping from slot to slot at the same pace. Time is whatever the caller says
 it is (advance()), so tests run faster than real time. Every overlap of two xbots is recorded as
 a collision.
@@ -89,7 +89,7 @@ class SimDriver(Driver):
 
     def rotate(self, xid, rz):
         xb = self._ready(xid)
-        if self.layout.flyway_at(xb.x, xb.y) is None:
+        if self.layout.spot_at(xb.x, xb.y) is None:
             raise DriverError(f"xbot {xid}: WRONGXBOTPOSITION")
         distance = abs(rz - xb.rz)
         total = _travel_time(distance, self.turn_speed, self.turn_accel)

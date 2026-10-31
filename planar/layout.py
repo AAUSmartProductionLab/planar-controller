@@ -25,7 +25,7 @@ EDGE_TOLERANCE_M = 0.0002
 SLOT_TOLERANCE_M = EDGE_TOLERANCE_M
 # A requested pose is a slot or flyway centre only if it is exactly one (but for rounding).
 EXACT_M = 1e-6
-# How close a move has to end to its target to have arrived, and an xbot to a flyway centre to turn.
+# How close a move has to end to its target to have arrived, and an xbot to a spot to turn.
 POSITION_TOLERANCE_M = 0.0005
 ANGLE_TOLERANCE_RAD = 0.005
 
@@ -185,6 +185,35 @@ class Layout:
         cx, cy = self.flyway_center(flyway)
         if abs(x - cx) < tolerance and abs(y - cy) < tolerance:
             return flyway
+        return None
+
+    # --- spots: the points an xbot turns on, (x, y) --------------------------------------------
+    # The PMC turns an xbot on a flyway centre, and where four flyways meet. A turn sweeps the
+    # square one flyway wide around the spot.
+
+    @cached_property
+    def junctions(self):
+        """The points where four flyways meet."""
+        s = self.flyway_size
+        present = set(self.flyways)
+        return [(c * s, r * s) for c in range(1, self.cols) for r in range(1, self.rows)
+                if {(c - 1, r - 1), (c, r - 1), (c - 1, r), (c, r)} <= present]
+
+    def spot_box(self, spot):
+        half = self.flyway_size / 2
+        return (spot[0] - half, spot[1] - half, spot[0] + half, spot[1] + half)
+
+    def spot_cells(self, spot):
+        return self.cells_in(self.spot_box(spot))
+
+    def spot_at(self, x, y, tolerance=POSITION_TOLERANCE_M):
+        """The spot this position is on (a flyway centre, or where four flyways meet), or None."""
+        flyway = self.flyway_at(x, y, tolerance)
+        if flyway is not None:
+            return self.flyway_center(flyway)
+        for spot in self.junctions:
+            if abs(x - spot[0]) < tolerance and abs(y - spot[1]) < tolerance:
+                return spot
         return None
 
     def describe(self):

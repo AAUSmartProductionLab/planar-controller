@@ -7,7 +7,8 @@ Each xbot is in one of these situations:
   and the planner may move it.
 - docked: anywhere else (at a station pose between slots, at a flyway centre, stopped half way
   by an abort). It covers every slot its square overlaps, and the planner treats those as walls.
-- busy with a macro: a rotation (only possible at a flyway centre) or the last move onto or off
+- busy with a macro: a rotation (only possible on a spot: a flyway centre, or where four flyways
+  meet) or the last move onto or off
   a pose between slots. It first claims the slots it will sweep, waits until the others have
   left them, and covers them until it is done.
 
@@ -31,8 +32,9 @@ turn at all), by a task of the coordinator's own that any request replaces.
 
 In line mode (lines.py) the planner plans on the lanes' graph instead of the whole lattice, and
 keeps every xbot off the slots of no lane but the way to and from its own target (and the idle
-area, the loading queue, for the ones nobody holds); turns are made on the turn spots, and there
-is no straight move off the lanes.
+area, the loading queue, for the ones nobody holds); turns are made on the turn spots, each on
+the one nearest to it, waiting behind it while another turns there, and there is no straight move
+off the lanes.
 
 Units: metres and radians.
 """
@@ -141,7 +143,7 @@ class Task:
     started: float
     seq: int = 0                   # the order requests were made in (the clock may not tell)
     halting: bool = False
-    flyway: tuple = None           # where it rotates
+    spot: tuple = None             # where it turns, (x, y)
     progress_at: float = 0.0
     claim_after: float = 0.0       # gave way with its claim: not to claim again before this
     internal: bool = False         # the coordinator's own (turning an idle xbot): a request replaces it
@@ -328,8 +330,9 @@ class Coordinator:
             log.info("PMC connected: table %dx%d flyways, holes %s, xbots %s", layout.cols, layout.rows,
                      sorted(layout.holes), sorted(readings))
             if lines:
+                spots = ", ".join(f"({x * 1000:.0f}, {y * 1000:.0f})" for x, y in lines.turn_spots)
                 log.info("line mode, %d lanes, turn spots %s:\n%s", len(lines.lanes),
-                         lines.turn_spots or "any flyway", lines.describe())
+                         f"{spots} mm" if spots else "any flyway centre", lines.describe())
                 if len(lines.idle) < len(self.agents):
                     log.warning("line mode: the idle area has %d slots for %d xbots; the free xbots that do not "
                                 "fit wait where they are, on a lane in the way", len(lines.idle), len(self.agents))
@@ -357,13 +360,13 @@ class Coordinator:
         agent = self.agents[xid]
         if agent.task is not None and not agent.task.internal:
             return ErrorID.BUSY
-        if not is_square_aligned(target.rz) and self.layout.flyway_at(target.x, target.y, EXACT_M) is None:
-            # It can only turn to an angle like that at a flyway centre, and only stay there.
+        if not is_square_aligned(target.rz) and self.layout.spot_at(target.x, target.y, EXACT_M) is None:
+            # It can only turn to an angle like that on a spot, and only stay there.
             return ErrorID.ANGLE_NOT_ALLOWED
         if not self.layout.on_table(target.x, target.y, target.rz):
             return ErrorID.NOT_ON_TABLE
         if not is_square_aligned(agent.pose.rz) and agent.cell is None \
-                and self.layout.flyway_at(agent.pose.x, agent.pose.y) is None:
+                and self.layout.spot_at(agent.pose.x, agent.pose.y) is None:
             return ErrorID.XBOT_CROOKED
         return ErrorID.NONE
 
@@ -686,8 +689,8 @@ class Coordinator:
             return
 
         if agent.cell is None:
-            # Docked: turn here if this is a flyway centre, else back onto the lattice.
-            here = layout.flyway_at(p.x, p.y)
+            # Docked: turn here if this is a spot, else back onto the lattice.
+            here = layout.spot_at(p.x, p.y)
             if here is not None and (at_target_xy or (turn and is_square_aligned(target.rz))):
                 self._turn_here(agent, here, target.rz)
                 return
@@ -695,30 +698,31 @@ class Coordinator:
             return
 
         if turn:
-            if task.flyway is None:
-                task.flyway = self._choose_flyway(agent, task)
-                if task.flyway is None:
+            if task.spot is None:
+                task.spot = self._choose_spot(agent, task)
+                if task.spot is None:
                     agent.want = agent.cell
                     return
-            cells = layout.flyway_cells(task.flyway)
+            cells = layout.spot_cells(task.spot)
             if agent.cell not in cells:
                 agent.want = self._nearest(agent, cells)
                 return
-            boxes = (layout.flyway_box(task.flyway),)
+            boxes = (layout.spot_box(task.spot),)
             if not self._claim(agent, boxes):
-                task.flyway = None  # someone else has it now; look again next time
+                if not self._fixed_spots:
+                    task.spot = None  # someone else has it now; look again next time
                 agent.want = agent.cell
                 return
             if not self._zone_clear(agent):
                 self._wait_for_zone(agent, now)
                 return
-            fx, fy = layout.flyway_center(task.flyway)
-            ops = [("move", fx, fy), ("rotate", target.rz)]
-            if not (abs(fx - target.x) < EXACT_M and abs(fy - target.y) < EXACT_M):
+            sx, sy = task.spot
+            ops = [("move", sx, sy), ("rotate", target.rz)]
+            if not (abs(sx - target.x) < EXACT_M and abs(sy - target.y) < EXACT_M):
                 exit_cell = min(sorted(cells), key=lambda c: self._static_distance(agent, c, self._target_cells(task)))
                 ops.append(("move", *layout.center(exit_cell)))
             self._run_ops(agent, ops, boxes)
-            task.flyway = None
+            task.spot = None
             return
 
         target_cell = layout.cell_at(target.x, target.y, target.rz, EXACT_M)  # else the final move goes there
@@ -752,13 +756,14 @@ class Coordinator:
             # planner may move it too, and claim again later.
             log.info("xbot %d: its claim did not clear in %.0f s; lets go of it for now", agent.xid, CLAIM_YIELD_S)
             agent.zone, agent.zone_boxes = None, ()
-            agent.task.flyway = None
+            if not self._fixed_spots:
+                agent.task.spot = None
             agent.task.claim_after = now + CLAIM_YIELD_S
         elif any(o is not agent and o.zone_boxes and not o.in_macro and o.zone_since < agent.zone_since
                  for o in self.agents.values()):
             log.info("xbot %d: gives way to an older claim", agent.xid)
             agent.zone, agent.zone_boxes = None, ()
-            agent.task.flyway = None
+            agent.task.spot = None
             agent.task.claim_after = now + CLAIM_YIELD_S
 
     def _queued(self, agent, task):
@@ -839,9 +844,9 @@ class Coordinator:
     def _claims(self, agent):
         return [b for o in self.agents.values() if o is not agent for b in o.zone_boxes]
 
-    def _turn_here(self, agent, flyway, rz):
-        """Turn on the flyway centre it stands on, once its neighbours are clear of the turn."""
-        boxes = (self.layout.flyway_box(flyway),)
+    def _turn_here(self, agent, spot, rz):
+        """Turn on the spot it stands on, once its neighbours are clear of the turn."""
+        boxes = (self.layout.spot_box(spot),)
         if self._claim(agent, boxes) and self._zone_clear(agent):
             self._run_ops(agent, [("rotate", rz)], boxes)
 
@@ -849,16 +854,16 @@ class Coordinator:
         """
         From a pose off the lattice onto the slot it covers nearest to where it goes next. It
         only travels square to the axes, so a crooked xbot straightens up first (which it can
-        only do on a flyway centre). A slot another xbot reaches into is not one to step onto;
+        only do on a spot). A slot another xbot reaches into is not one to step onto;
         when every slot it covers is one, it backs out sideways first (one xbot width) onto a
         pose with a free slot under it.
         """
         layout = self.layout
         p = agent.pose
         if not is_square_aligned(p.rz):
-            flyway = layout.flyway_at(p.x, p.y)
-            if flyway is None:
-                log.error("xbot %d is turned %.1f deg off a flyway centre and cannot travel",
+            spot = layout.spot_at(p.x, p.y)
+            if spot is None:
+                log.error("xbot %d is turned %.1f deg off a spot and cannot travel",
                           agent.xid, math.degrees(p.rz))
                 self._fail(agent, ErrorID.XBOT_CROOKED)
                 return
@@ -867,7 +872,7 @@ class Coordinator:
             else:
                 quarter = math.pi / 2
                 rz = wrap_angle(round(p.rz / quarter) * quarter)
-            self._turn_here(agent, flyway, rz)
+            self._turn_here(agent, spot, rz)
             return
         here = layout.square(p.x, p.y, p.rz)
         taken = [layout.square(o.pose.x, o.pose.y, o.pose.rz) for o in self.agents.values()
@@ -905,8 +910,8 @@ class Coordinator:
         return self.layout.footprint(t.x, t.y, t.rz) & self.layout.cells
 
     def _toward(self, agent, task):
-        if task.flyway is not None:
-            return self.layout.flyway_cells(task.flyway)
+        if task.spot is not None:
+            return self.layout.spot_cells(task.spot)
         return self._target_cells(task)
 
     def _finish(self, agent, ok, error=ErrorID.NONE):
@@ -1084,9 +1089,9 @@ class Coordinator:
                     walls |= {c for a in other.motion.actions for c in (a.frm, a.to)}
         return walls
 
-    def _static_distance(self, agent, cell, toward):
+    def _static_distance(self, agent, cell, toward, around_walls=True):
         """Steps from cell to the nearest of toward, around walls only (in line mode: on the lanes)."""
-        free = self.layout.cells - self._walls(exclude=agent)
+        free = self.layout.cells - (self._walls(exclude=agent) if around_walls else set())
         toward = set(toward)
         if cell in toward:
             return 0
@@ -1108,30 +1113,45 @@ class Coordinator:
     def _nearest(self, agent, cells):
         return min(sorted(cells), key=lambda c: self._static_distance(agent, agent.cell, [c]))
 
-    def _choose_flyway(self, agent, task):
-        """The flyway to turn on: its whole square clear of xbots that stay put and of others'
-        claims, with the least detour."""
-        blocked = [self.layout.square(o.pose.x, o.pose.y, o.pose.rz) for o in self.agents.values()
-                   if o is not agent and self._is_wall(o)]
-        blocked += self._claims(agent)
+    @property
+    def _fixed_spots(self):
+        """Line mode with turn spots: each xbot turns on the one nearest to it, and waits for it."""
+        return bool(self.lines and self.lines.turn_spots)
+
+    def _choose_spot(self, agent, task):
+        """
+        The spot to turn on. With turn spots, the one nearest to it along the lanes (of as near
+        ones, the one with the least detour), whoever is on it now: it waits its turn there rather
+        than drive on to another. Else the flyway centre whose whole square is clear of xbots that
+        stay put and of others' claims, with the least detour.
+        """
+        layout = self.layout
         target_cells = self._target_cells(task)
-        candidates = (self.lines.turn_spots if self.lines and self.lines.turn_spots else self.layout.flyways)
         if not is_square_aligned(task.target.rz):
-            # It may not travel turned like that: it turns on the target's own flyway.
-            candidates = [self.layout.flyway_at(task.target.x, task.target.y, EXACT_M)]
-        best, best_cost = None, mapf.INF
-        for flyway in candidates:
-            if any(overlap(self.layout.flyway_box(flyway), b) for b in blocked):
+            # It may not travel turned like that: it turns on the target's own spot.
+            fixed, candidates = False, [layout.spot_at(task.target.x, task.target.y, EXACT_M)]
+        elif self._fixed_spots:
+            fixed, candidates = True, self.lines.turn_spots
+        else:
+            fixed, candidates = False, [layout.flyway_center(f) for f in layout.flyways]
+        blocked = [] if fixed else [layout.square(o.pose.x, o.pose.y, o.pose.rz) for o in self.agents.values()
+                                    if o is not agent and self._is_wall(o)] + self._claims(agent)
+        best, best_cost = None, (mapf.INF, mapf.INF)
+        for spot in candidates:
+            if any(overlap(layout.spot_box(spot), b) for b in blocked):
                 continue
-            cells = self.layout.flyway_cells(flyway)
-            cost = self._static_distance(agent, agent.cell, cells)
-            if cost >= mapf.INF:
+            cells = layout.spot_cells(spot)
+            there = self._static_distance(agent, agent.cell, cells, around_walls=not fixed)
+            if there >= mapf.INF:
                 continue
-            cost += min(self._static_distance(agent, c, target_cells) for c in cells)
+            on = min(self._static_distance(agent, c, target_cells, around_walls=not fixed) for c in cells)
+            if on >= mapf.INF:
+                continue
+            cost = (there, there + on) if fixed else (there + on, 0)
             if cost < best_cost:
-                best, best_cost = flyway, cost
+                best, best_cost = spot, cost
         if best is not None:
-            log.info("xbot %d: turns on flyway %s", agent.xid, best)
+            log.info("xbot %d: turns on (%.0f, %.0f) mm", agent.xid, best[0] * 1000, best[1] * 1000)
         return best
 
     def _plan_if_needed(self, now):
@@ -1341,6 +1361,12 @@ class Coordinator:
         candidates = [c for c in reach if c in usable]
         if not candidates:
             return start
+        if self.lines:
+            # On the lanes: the one fewest steps short of it on the way there, so it queues behind
+            # a taken place (a turn spot another turns on) rather than beside or past it.
+            short = self._steps_from(near, free | {near}, reverse=True)
+            return min(sorted(candidates), key=lambda c: (short.get(c, mapf.INF), abs(c[0] - near[0]) + abs(c[1] - near[1]),
+                                                          c != start))
         return min(sorted(candidates), key=lambda c: (abs(c[0] - near[0]) + abs(c[1] - near[1]), c != start))
 
     def _load(self, order, configs, goals, leaving):
