@@ -19,12 +19,20 @@ Against a running controller (python -m planar):
     python tests/line_scenario.py --endpoint opc.tcp://127.0.0.1:4840/ --agents 3 --products 3
 
 The stations are STATIONS below unless --stations names a JSON file of {"<station>": [x, y, rz]} (mm,
-degrees, on the table), e.g. the modules' transfer points taken from their AASs.
+degrees, on the table), e.g. the modules' transfer points taken from their AASs, or --layout names
+a folder of config/layouts/ (its stations.json; start the controller with its controller.env):
+
+    python tests/line_scenario.py --layout config/layouts/clockwise-outwards
+
+While the agents run, the shuttles are watched: no two may overlap, every turn must be made on a
+turn spot (in line mode the layout's, else a flyway centre or where four flyways meet) by at most
+half a turn, and in line mode every step from a lane slot to the next must go the lane's way.
 """
 
 import argparse
 import asyncio
 import json
+import os
 import random
 import sys
 import time
@@ -32,6 +40,10 @@ import uuid
 from dataclasses import dataclass, field
 
 from asyncua import Client, ua
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # planar, for the checks
+from planar.layout import Layout  # noqa: E402
+from planar.lines import Lines, parse  # noqa: E402
 
 NAMESPACE = "urn:aau:smartproductionlab:planar"
 
@@ -72,6 +84,8 @@ class Report:
     problems: list = field(default_factory=list)
     occupy_refusals: int = 0
     overlaps: list = field(default_factory=list)
+    lane_steps: int = 0                         # line mode: steps from a lane slot to the next
+    turns: list = field(default_factory=list)   # (shuttle, x mm, y mm, degrees turned, + counterclockwise)
 
     def problem(self, text):
         self.problems.append(text)
@@ -252,12 +266,78 @@ class ProductAgent:
             self.report.problem(f"{product.name}: {product.shuttle} moved at {station}: {before} -> {after}")
 
 
-async def watch(endpoint, shuttles, report, stop):
-    """Sample every shuttle's pose and note any two that overlap (axis-aligned squares)."""
+class MotionCheck:
+    """Where the shuttles go between samples: a step from a lane slot to the next against the lane's
+    way (line mode), a turn off a turn spot or by more than half a turn."""
+
+    SETTLED_S = 0.3  # a turn is over when the angle has not changed for this long
+
+    def __init__(self, table, lines, report):
+        self.table, self.lines, self.report = table, lines, report
+        self.forward = {(a, b) for _, cells in lines.lanes for a, b in zip(cells, cells[1:])} if lines else set()
+        self.cell, self.rz, self.turning = {}, {}, {}
+
+    def _slot(self, x, y):
+        pitch = self.table.pitch * 1000.0
+        cell = (int(x // pitch), int(y // pitch))
+        on = abs(x - (cell[0] + 0.5) * pitch) < 5.0 and abs(y - (cell[1] + 0.5) * pitch) < 5.0
+        return cell if on else None
+
+    def _on_spot(self, x, y):
+        if self.lines and self.lines.turn_spots:
+            return any(abs(sx * 1000.0 - x) < 3.0 and abs(sy * 1000.0 - y) < 3.0 for sx, sy in self.lines.turn_spots)
+        return self.table.spot_at(x / 1000.0, y / 1000.0, tolerance=0.003) is not None
+
+    def sample(self, shuttle, pose, now):
+        x, y, rz = pose
+        cell = self._slot(x, y)
+        last = self.cell.get(shuttle)
+        if self.lines and cell and last and last != cell and abs(last[0] - cell[0]) + abs(last[1] - cell[1]) == 1 \
+                and {last, cell} <= self.lines.lane_cells:
+            self.report.lane_steps += 1
+            if (last, cell) not in self.forward:
+                self.report.problem(f"{shuttle} went from slot {last} to {cell}, against the lane")
+        if cell:
+            self.cell[shuttle] = cell
+        if shuttle in self.rz:
+            step = (rz - self.rz[shuttle] + 180.0) % 360.0 - 180.0
+            if abs(step) > 0.05:
+                turn = self.turning.setdefault(shuttle, [x, y, 0.0, now])
+                turn[2] += step
+                turn[3] = now
+            elif shuttle in self.turning and now - self.turning[shuttle][3] > self.SETTLED_S:
+                tx, ty, swept, _ = self.turning.pop(shuttle)
+                self.report.turns.append((shuttle, round(tx), round(ty), round(swept)))
+                if not self._on_spot(tx, ty):
+                    self.report.problem(f"{shuttle} turned at ({tx:.0f}, {ty:.0f}) mm, not on a turn spot")
+                if abs(swept) > 180.5:
+                    self.report.problem(f"{shuttle} turned {swept:+.0f} deg at ({tx:.0f}, {ty:.0f}) mm, the long way")
+        self.rz[shuttle] = rz
+
+
+async def motion_check(opc, report):
+    """The check for the table the controller has (connected, so after its Reset)."""
+    pmc = ("PlanarTable", "Equipment", "PMC")
+    holes = frozenset(tuple(int(v) for v in h.split(",")) for h in (await opc.read(*pmc, "Holes")).split())
+    table = Layout(await opc.read(*pmc, "Columns"), await opc.read(*pmc, "Rows"), holes,
+                   await opc.read(*pmc, "FlywaySize") / 1000.0)
+    lines = None
+    if await opc.read("PlanarTable", "Equipment", "Mode") == "line":
+        lines = Lines(parse(await opc.read("PlanarTable", "Equipment", "LineLayout")), table)
+    return MotionCheck(table, lines, report)
+
+
+async def watch(endpoint, shuttles, report, stop, check=None):
+    """Sample every shuttle's pose; note any two that overlap (axis-aligned squares), and tell the
+    check where each is."""
     opc = await _open(endpoint)
     try:
         while not stop.is_set():
             poses = {s: await opc.pose(s) for s in shuttles}
+            if check:
+                now = time.monotonic()
+                for s, pose in poses.items():
+                    check.sample(s, pose, now)
             names = sorted(poses)
             for a in range(len(names)):
                 for b in range(a + 1, len(names)):
@@ -280,13 +360,14 @@ async def run_line(endpoint, agents=3, products=3, process_s=(0.5, 1.5), fail_p=
     try:
         await bring_up(opc)
         shuttles = await shuttles_of(opc)
+        check = await motion_check(opc, report) if sample else None
     finally:
         await opc.client.disconnect()
     stations = {name: asyncio.Lock() for name in places}
     workers = [ProductAgent(f"Agent{k + 1}", endpoint, shuttles, stations, report, random.Random(seed * 100 + k),
                             products, process_s, fail_p, places) for k in range(agents)]
     stop = asyncio.Event()
-    watcher = asyncio.create_task(watch(endpoint, shuttles, report, stop)) if sample else None
+    watcher = asyncio.create_task(watch(endpoint, shuttles, report, stop, check)) if sample else None
     try:
         await asyncio.gather(*(w.run() for w in workers))
     finally:
@@ -302,9 +383,24 @@ def summary(report):
     finished = sum(p.outcome == "finished" for p in report.products)
     discarded = sum(p.outcome.startswith("discarded") for p in report.products)
     moves = [t for p in report.products for _, t in p.steps]
+    turned = {}
+    for *_, degrees in report.turns:
+        turned[degrees] = turned.get(degrees, 0) + 1
     return (f"{len(report.products)} products: {finished} finished, {discarded} discarded; "
             f"{len(moves)} moves, mean {sum(moves) / max(1, len(moves)):.1f}s, longest {max(moves, default=0):.1f}s; "
-            f"{report.occupy_refusals} occupy refusals (5); {len(report.problems)} problems")
+            f"{report.occupy_refusals} occupy refusals (5); {report.lane_steps} lane steps; "
+            f"turns {', '.join(f'{n}x {d:+d} deg' for d, n in sorted(turned.items())) or 'none'}; "
+            f"{len(report.problems)} problems")
+
+
+def read_stations(path):
+    """{"<station>": (x mm, y mm, rz deg)}, every station of ROUTE there."""
+    with open(path, encoding="utf-8") as f:
+        places = {name: tuple(float(v) for v in pose) for name, pose in json.load(f).items()}
+    missing = [name for name in ROUTE if name not in places]
+    if missing:
+        raise SystemExit(f"{path}: no {', '.join(missing)} (the stations are {', '.join(ROUTE)})")
+    return places
 
 
 def main():
@@ -315,11 +411,12 @@ def main():
     p.add_argument("--fail", type=float, default=0.2, help="chance a process step fails")
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--stations", help='a JSON file of {"<station>": [x, y, rz]} instead of STATIONS')
+    p.add_argument("--layout", metavar="DIR", help="a folder of config/layouts/: its stations.json")
     args = p.parse_args()
     places = None
-    if args.stations:
-        with open(args.stations, encoding="utf-8") as f:
-            places = {name: tuple(float(v) for v in pose) for name, pose in json.load(f).items()}
+    stations = args.stations or (os.path.join(args.layout, "stations.json") if args.layout else None)
+    if stations:
+        places = read_stations(stations)
     report = asyncio.run(run_line(args.endpoint, args.agents, args.products, fail_p=args.fail, seed=args.seed,
                                   places=places))
     print(summary(report))

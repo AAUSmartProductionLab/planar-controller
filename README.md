@@ -253,6 +253,12 @@ I>>+>>^#     #        a slot of no lane
 - `LINE_LAYOUT` is read once at start-up. From a URL the controller waits for the server while it
   cannot be reached; a layout that is not valid JSON, or not a layout, stops it with the reason.
   `config/line-layout.example.json` is the layout above; `config/` is mounted into the container.
+- **Layouts to test with** are in [`config/layouts/`](config/layouts/), each with stations for
+  the product agents of `tests/line_scenario.py` and the controller's settings for it
+  (`controller.env`). `pytest` runs the agents on each on the simulated table, and
+  `python tests/line_scenario.py --layout config/layouts/<name>` against a running controller
+  (e.g. on Planar Motor's simulator), checking that the shuttles keep to the lanes' way and turn
+  only on turn spots.
 - **From an AAS**: the layout is a `PlanarRouting` collection in the line's `Parameters`, and
   `LINE_LAYOUT` is its `$value` (`…/submodels/<Parameters>/submodel-elements/PlanarRouting/$value`):
 

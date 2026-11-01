@@ -235,12 +235,8 @@ def test_xbots_wait_for_the_turn_spot_nearest_to_them_rather_than_drive_on_to_an
 
 # Clockwise round the ring one slot in from the edge, a turn spot on every edge flyway's centre,
 # a station on each side, beside the ring (the xbot faces the module there: outwards).
-CLOCKWISE = {
-    "lanes": [{"name": "clockwise", "points": [[180, 180], [180, 540], [780, 540], [780, 180], [180, 180]], "oneWay": True}],
-    "turnSpots": [[120, 120], [360, 120], [600, 120], [840, 120], [120, 360], [840, 360],
-                  [120, 600], [360, 600], [600, 600], [840, 600]],
-    "idleArea": [[60, 540], [60, 300]],
-}
+CLOCKWISE = json.loads((Path(__file__).parent.parent / "config" / "layouts" / "clockwise-outwards" / "layout.json")
+                       .read_text(encoding="utf-8"))
 
 
 def test_round_the_sides_facing_outwards_every_turn_is_a_quarter_turn_on_a_turn_spot():
