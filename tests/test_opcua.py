@@ -10,6 +10,7 @@ from planar.modules import PlanarController
 from planar.opcua_server import NAMESPACE, OpcUaServer
 from planar.sim_driver import SimDriver
 from planar.statemachines import ErrorID, ModuleState, SkillState
+from planar.zones import ZoneSpec
 
 SIM = Layout(cols=4, rows=3, holes=frozenset({(2, 1)}))
 
@@ -26,7 +27,8 @@ def test_a_move_over_opc_ua():
 
 async def _move_over_opc_ua():
     sim = SimDriver(SIM, {1: (0.06, 0.06, 0.0), 2: (0.90, 0.66, 0.0)})
-    ctl = PlanarController(sim, [1, 2])
+    sim.flyway_status = {(0, 0): (12.0, 41.0, 36.0, 30.5)}
+    ctl = PlanarController(sim, [1, 2], zones=[ZoneSpec("Service", (0.72, 0.48, 0.96, 0.72))])
     ctl.coordinator.on_tick.insert(0, lambda: sim.advance(time.monotonic()))
     endpoint = f"opc.tcp://127.0.0.1:{free_port()}/"
     server = OpcUaServer(ctl, endpoint)
@@ -83,6 +85,31 @@ async def _move_over_opc_ua():
             assert abs(await read("PlanarShuttle1", "Equipment", "Xbot", "Rz") - 90.0) < 0.1
             assert await read("PlanarShuttle1", "Skills", "MoveToPosition", "Parameters", "Y") == 660.0
             assert await wait(await path("PlanarShuttle1", "Skills", "MoveToPosition", "State"), int(SkillState.IDLE), 3)
+
+            # Hold and Unhold; the payload, the occupant's to set.
+            assert await call(table, "Hold", session) == (True, ErrorID.NONE)
+            assert await wait(await path("PlanarShuttle1", "Module", "State"), int(ModuleState.HELD))
+            assert await call(table, "Unhold", session) == (True, ErrorID.NONE)
+            assert await wait(await path("PlanarShuttle1", "Module", "State"), int(ModuleState.EXECUTE))
+            assert [await read(*xbot, k) for k in ("PayloadKg", "PayloadCgHeight", "MaxAcceleration")] == [0.0, 0.0, 20.0]
+            xbot_node = await path(*xbot)
+            assert await call(xbot_node, "SetPayload", session, mm(0.8), mm(25)) == (False, ErrorID.OUT_OF_RANGE)
+            assert await call(xbot_node, "SetPayload", session, mm(0.25), mm(25)) == (True, ErrorID.NONE)
+            assert await wait(await path(*xbot, "PayloadKg"), 0.25)
+            assert await read(*xbot, "PayloadCgHeight") == 25.0
+
+            # A zone, and the flyways (added at the Reset).
+            zone = ("PlanarTable", "Equipment", "Zones", "Service")
+            assert [await read(*zone, k) for k in ("State", "Xbots")] == ["ACTIVATED_UNFENCED", "1 2"]  # 1 moved in
+            assert await call(await path(*zone), "Deactivate", session) == (True, ErrorID.NONE)
+            assert await wait(await path(*zone, "State"), "LOADING_FENCED")
+            assert await read("PlanarShuttle2", "Equipment", "Xbot", "XbotState") == "XBOT_DISABLED"
+            assert await call(await path(*zone), "Activate", session) == (True, ErrorID.NONE)
+            assert await wait(await path(*zone, "State"), "ACTIVATED_UNFENCED")
+            flyway = ("PlanarTable", "Equipment", "PMC", "Flyways", "Flyway_0_0")
+            assert await wait(await path(*flyway, "PowerConsumption"), 12.0)
+            assert await read(*flyway, "MotorTemperature") == 30.5
+            assert math.isnan(await read("PlanarTable", "Equipment", "PMC", "Flyways", "Flyway_3_2", "CpuTemperature"))
 
             assert await call(await path("PlanarShuttle1", "Occupation"), "Release", session) == (True, ErrorID.NONE)
 

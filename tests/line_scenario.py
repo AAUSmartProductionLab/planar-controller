@@ -27,6 +27,9 @@ a folder of config/layouts/ (its stations.json; start the controller with its co
 While the agents run, the shuttles are watched: no two may overlap, every turn must be made on a
 turn spot (in line mode the layout's, else a flyway centre or where four flyways meet) by at most
 half a turn, and in line mode every step from a lane slot to the next must go the lane's way.
+
+With --hold-every S the table is held every S seconds for HOLD_S and unheld: no shuttle may move
+while it is held, and the agents wait for the Unhold where a held shuttle refuses a Start (4).
 """
 
 import argparse
@@ -59,6 +62,8 @@ ROUTE = ["Infeed", "Filling", "Stoppering", "Capping", "Outfeed"]
 PROCESS_STEPS = {"Filling", "Stoppering", "Capping"}  # the ones that can fail
 
 SUCCEEDED, FAILED = 3, 4
+EXECUTE, HELD = 6, 11
+HOLD_S = 2.0
 
 
 def _s(value):
@@ -86,6 +91,9 @@ class Report:
     overlaps: list = field(default_factory=list)
     lane_steps: int = 0                         # line mode: steps from a lane slot to the next
     turns: list = field(default_factory=list)   # (shuttle, x mm, y mm, degrees turned, + counterclockwise)
+    holds: int = 0                              # --hold-every: the table held and unheld
+    hold_refusals: int = 0                      # Starts refused (4) while it was held
+    holding: bool = False
 
     def problem(self, text):
         self.problems.append(text)
@@ -235,7 +243,12 @@ class ProductAgent:
         x, y, rz = self.places[station]
         skill = (product.shuttle, "Skills", "MoveToPosition")
         t0 = time.monotonic()
-        answer = await opc.call(skill, "Start", _s(session), _d(x), _d(y), _d(rz))
+        while True:
+            answer = await opc.call(skill, "Start", _s(session), _d(x), _d(y), _d(rz))
+            if answer != (False, 4) or not self.report.holding:
+                break
+            self.report.hold_refusals += 1  # held: it starts once unheld
+            await asyncio.sleep(0.2)
         if leaving:
             self.stations[leaving].release()  # the product is on its way out of it
         if answer != (True, 0):
@@ -305,6 +318,8 @@ class MotionCheck:
                 turn = self.turning.setdefault(shuttle, [x, y, 0.0, now])
                 turn[2] += step
                 turn[3] = now
+            elif shuttle in self.turning and self.report.holding:
+                self.turning[shuttle][3] = now  # paused half way: it goes on once unheld
             elif shuttle in self.turning and now - self.turning[shuttle][3] > self.SETTLED_S:
                 tx, ty, swept, _ = self.turning.pop(shuttle)
                 self.report.turns.append((shuttle, round(tx), round(ty), round(swept)))
@@ -351,9 +366,48 @@ async def watch(endpoint, shuttles, report, stop, check=None):
         await opc.client.disconnect()
 
 
+async def holder(endpoint, shuttles, report, stop, every):
+    """Hold the table every few seconds for HOLD_S, then unhold it: nothing may move meanwhile."""
+    opc = await _open(endpoint)
+    module = ("PlanarTable", "Module")
+    try:
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), every)
+                break
+            except asyncio.TimeoutError:
+                pass
+            report.holding = True
+            answer = await opc.call(module, "Hold", _s(""))
+            if answer != (True, 0):
+                report.problem(f"Hold answered {answer}")
+                report.holding = False
+                continue
+            if not await _wait_value(opc, (*module, "State"), (HELD,), 3):
+                report.problem("the table was not Held 3 s after Hold")
+            await asyncio.sleep(0.3)  # a move's deceleration is over
+            before = {s: await opc.pose(s) for s in shuttles}
+            await asyncio.sleep(HOLD_S)
+            for s in shuttles:
+                after = await opc.pose(s)
+                if any(abs(a - b) > 0.5 for a, b in zip(before[s], after)):
+                    report.problem(f"{s} moved while the table was held: {before[s]} -> {after}")
+            answer = await opc.call(module, "Unhold", _s(""))
+            if answer != (True, 0):
+                report.problem(f"Unhold answered {answer}")
+            for s in shuttles:
+                if not await _wait_value(opc, (s, "Module", "State"), (EXECUTE,), 3):
+                    report.problem(f"{s} was not in Execute 3 s after Unhold")
+            report.holding = False
+            report.holds += 1
+    finally:
+        await opc.client.disconnect()
+
+
 async def run_line(endpoint, agents=3, products=3, process_s=(0.5, 1.5), fail_p=0.2, seed=1, sample=True,
-                   places=None):
-    """``places``: where each station of ROUTE is, (x, y, rz) on the table; STATIONS if not given."""
+                   places=None, hold_every=None):
+    """``places``: where each station of ROUTE is, (x, y, rz) on the table; STATIONS if not given.
+    ``hold_every``: seconds between holds of the table (None: it is not held)."""
     places = dict(places or STATIONS)
     report = Report()
     opc = await _open(endpoint)
@@ -368,12 +422,14 @@ async def run_line(endpoint, agents=3, products=3, process_s=(0.5, 1.5), fail_p=
                             products, process_s, fail_p, places) for k in range(agents)]
     stop = asyncio.Event()
     watcher = asyncio.create_task(watch(endpoint, shuttles, report, stop, check)) if sample else None
+    holding = asyncio.create_task(holder(endpoint, shuttles, report, stop, hold_every)) if hold_every else None
     try:
         await asyncio.gather(*(w.run() for w in workers))
     finally:
         stop.set()
-        if watcher:
-            await watcher
+        for task in (watcher, holding):
+            if task:
+                await task
     if report.overlaps:
         report.problem(f"{len(report.overlaps)} sampled overlaps, first {report.overlaps[0]}")
     return report
@@ -390,7 +446,8 @@ def summary(report):
             f"{len(moves)} moves, mean {sum(moves) / max(1, len(moves)):.1f}s, longest {max(moves, default=0):.1f}s; "
             f"{report.occupy_refusals} occupy refusals (5); {report.lane_steps} lane steps; "
             f"turns {', '.join(f'{n}x {d:+d} deg' for d, n in sorted(turned.items())) or 'none'}; "
-            f"{len(report.problems)} problems")
+            + (f"{report.holds} holds ({report.hold_refusals} Starts refused while held); " if report.holds else "")
+            + f"{len(report.problems)} problems")
 
 
 def read_stations(path):
@@ -412,13 +469,14 @@ def main():
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--stations", help='a JSON file of {"<station>": [x, y, rz]} instead of STATIONS')
     p.add_argument("--layout", metavar="DIR", help="a folder of config/layouts/: its stations.json")
+    p.add_argument("--hold-every", type=float, metavar="S", help="hold the table every S seconds, for 2 s")
     args = p.parse_args()
     places = None
     stations = args.stations or (os.path.join(args.layout, "stations.json") if args.layout else None)
     if stations:
         places = read_stations(stations)
     report = asyncio.run(run_line(args.endpoint, args.agents, args.products, fail_p=args.fail, seed=args.seed,
-                                  places=places))
+                                  places=places, hold_every=args.hold_every))
     print(summary(report))
     sys.exit(1 if report.problems else 0)
 

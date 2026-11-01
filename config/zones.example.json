@@ -1,0 +1,6 @@
+{
+  "zones": [
+    {"name": "Service", "from": [720, 480], "to": [960, 720]},
+    {"name": "Filling", "from": [240, 480], "to": [480, 720], "speed": 0.5}
+  ]
+}

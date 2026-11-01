@@ -27,11 +27,13 @@ services:
       IDLE_RZ: ${IDLE_RZ:-}
       MODE: ${MODE:-free}
       LINE_LAYOUT: ${LINE_LAYOUT:-}
+      ZONES: ${ZONES:-}
       XBOT_SPEED: ${XBOT_SPEED:-0.5}
       XBOT_ACCEL: ${XBOT_ACCEL:-2.0}
+      XBOT_JERK: ${XBOT_JERK:-}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
-      - ./config:/app/config:ro  # the line layout file (LINE_LAYOUT=config/...)
+      - ./config:/app/config:ro  # the line layout and zones files (LINE_LAYOUT=config/..., ZONES=config/...)
     logging:
       driver: json-file
       options:

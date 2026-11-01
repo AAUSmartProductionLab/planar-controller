@@ -25,7 +25,8 @@ def free_port():
         return s.getsockname()[1]
 
 
-async def _line(agents, products, seed, loading_station=None, sample=False, places=None, turn_speed=20.0, **kw):
+async def _line(agents, products, seed, loading_station=None, sample=False, places=None, turn_speed=20.0,
+                hold_every=None, **kw):
     # Three xbots on the flyway centres of the left column, as in the simulation tool; fast moves
     # (turns slow enough to be sampled when the shuttles are watched).
     sim = SimDriver(SIM, {1: (0.12, 0.12, 0.0), 2: (0.12, 0.36, 0.0), 3: (0.12, 0.60, 0.0)},
@@ -39,7 +40,7 @@ async def _line(agents, products, seed, loading_station=None, sample=False, plac
     serving = asyncio.create_task(server.run())
     try:
         report = await run_line(endpoint, agents=agents, products=products, process_s=(0.1, 0.3),
-                                fail_p=0.2, seed=seed, sample=sample, places=places)
+                                fail_p=0.2, seed=seed, sample=sample, places=places, hold_every=hold_every)
     finally:
         serving.cancel()
         ctl.shutdown()
@@ -83,6 +84,18 @@ def test_each_layout_of_config_layouts_runs_the_line(folder):
     assert not sim.collisions, sim.collisions[:3]
     assert len(report.products) == 12 and "finished" in [p.outcome for p in report.products]
     assert report.lane_steps > 0 and report.turns, "the shuttles were watched"
+    assert all(abs(turn) <= math.pi + 1e-9 for _, turn in sim.turns)
+
+
+def test_the_line_runs_on_with_the_table_held_now_and_then_and_nothing_moves_while_it_is():
+    folder = LAYOUTS[0]
+    report, sim = asyncio.run(_line(3, 3, 1, sample=True, places=read_stations(folder / "stations.json"),
+                                    turn_speed=6.0, line_spec=load(str(folder / "layout.json")),
+                                    idle_rz=math.radians(180), hold_every=3.0))
+    print(summary(report))
+    assert not report.problems, report.problems
+    assert not sim.collisions, sim.collisions[:3]
+    assert len(report.products) == 9 and report.holds >= 2
     assert all(abs(turn) <= math.pi + 1e-9 for _, turn in sim.turns)
 
 

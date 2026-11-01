@@ -10,7 +10,13 @@ script runs it from where it is installed (PMC_SIM_DIR, default the installer's 
 a copy in pmc-sim/ next to this repository's root, which git and Docker ignore.
 
 The engine is what the window (Virtual PMC UI.exe) starts: Dlls\VirtualPMC.exe, run from the
-tool's folder; it reads the table and xbots from the folder's config\ and listens on port 8888.
+tool's folder; it reads the table and xbots from the folder's config\ and listens on UDP port
+8888. While the window is open, an engine started here may never listen: start it from the
+window then.
+
+Every pmclib program must disconnect from it when it ends (the controller does): the engine
+writes an error to its trace log (%APPDATA%\Planar Motor Inc\Virtual PMC\data\PMTraceLog.txt)
+for every read of a connection left open, gigabytes an hour, until it takes no new connections.
 #>
 param(
     [ValidateSet("start", "stop", "restart", "status")]
@@ -33,12 +39,12 @@ function Find-Tool {
 function Get-Engine { Get-Process VirtualPMC -ErrorAction SilentlyContinue }
 
 function Test-Listening {
-    try {
-        $client = New-Object System.Net.Sockets.TcpClient
-        $client.Connect("127.0.0.1", $Port)
-        $client.Close()
-        return $true
-    } catch { return $false }
+    # The engine's own UDP port: another program may hold TCP 8888 (an OpenTelemetry collector does).
+    $engine = Get-Engine
+    if (-not $engine) { return $false }
+    $udp = Get-NetUDPEndpoint -LocalPort $Port -ErrorAction SilentlyContinue |
+           Where-Object { $engine.Id -contains $_.OwningProcess }
+    return [bool]$udp
 }
 
 function Stop-Engine {
@@ -57,7 +63,11 @@ function Start-Engine {
     $deadline = (Get-Date).AddSeconds($TimeoutS)
     while (-not (Test-Listening)) {
         if ($engine.HasExited) { throw "VirtualPMC.exe exited with code $($engine.ExitCode)" }
-        if ((Get-Date) -gt $deadline) { throw "VirtualPMC.exe is not listening on port $Port after $TimeoutS s" }
+        if ((Get-Date) -gt $deadline) {
+            throw ("VirtualPMC.exe is not listening on port $Port after $TimeoutS s. Started on its own while the " +
+                   "tool's window (Virtual PMC UI) is open, it may take no connections: stop it and start the " +
+                   "simulation from the window")
+        }
         Start-Sleep -Milliseconds 500
     }
     "started from $dir (pid $($engine.Id)), listening on port $Port"

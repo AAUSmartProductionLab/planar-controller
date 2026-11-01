@@ -2,12 +2,16 @@
 The OPC UA interface, laid out like a generated module's (work.md, "A generated module"):
 
   /Objects/<Module>/Occupation      Occupy(Session), Release(Session); Occupied
-  /Objects/<Module>/Module          Reset, Start, Stop, Abort, Clear (Session); State, ErrorID
+  /Objects/<Module>/Module          Reset, Start, Hold, Unhold, Stop, Abort, Clear (Session);
+                                    State, ErrorID
   /Objects/<Module>/Skills/<Skill>  Start(Session, <parameters>), Stop, Abort, Reset (Session);
                                     State, ErrorID, Parameters/<p>, Results/<r>
-  /Objects/<Module>/Equipment/<Item>  the table's PMC: Connected and the layout (Columns, Rows,
-                                    FlywaySize, Holes), its LoadingQueue, IdleRz (writable), Mode
-                                    and LineLayout; a shuttle's Xbot: X, Y, Rz, XbotState
+  /Objects/<Module>/Equipment/<Item>  the table's PMC: Connected, the layout (Columns, Rows,
+                                    FlywaySize, Holes) and Flyways/Flyway_<c>_<r> (power and
+                                    temperatures); its LoadingQueue, IdleRz (writable), Mode,
+                                    LineLayout and Zones/<name> (State, Xbots; Deactivate,
+                                    Activate); a shuttle's Xbot: X, Y, Rz, XbotState, the payload
+                                    (PayloadKg, PayloadCgHeight, MaxAcceleration; SetPayload)
 
 Every method answers [Accepted, ErrorID] at once. A MoveToPosition that was accepted finishes
 when the xbot has arrived: its State turns Succeeded (3), or Failed (4) with an ErrorID.
@@ -58,6 +62,8 @@ class OpcUaServer:
         self._writable = []  # (node, write(value))
         self._last = {}
         self._refreshing = asyncio.Lock()
+        self._flyways = None   # Equipment/PMC/Flyways, its flyways added once the layout is known
+        self._flyway_nodes = set()
 
     async def init(self):
         self.server = Server()
@@ -93,7 +99,7 @@ class OpcUaServer:
         await self._variable(occupation, "Occupied", lambda m=module: m.occupation.occupied, ua.VariantType.Boolean)
 
         control = await obj.add_object(idx, "Module")
-        for command in ("Reset", "Start", "Stop", "Abort", "Clear"):
+        for command in ("Reset", "Start", "Hold", "Unhold", "Stop", "Abort", "Clear"):
             await self._method(control, command, lambda s, c=command, m=module: m.command(c, s), [SESSION])
         await self._variable(control, "State", lambda m=module: int(m.state), ua.VariantType.Int32)
         await self._variable(control, "ErrorID", lambda m=module: int(m.error), ua.VariantType.Int32)
@@ -143,6 +149,9 @@ class OpcUaServer:
         await self._variable(pmc, "FlywaySize", layout(lambda t: t.flyway_size * 1000.0, 0.0), ua.VariantType.Double)
         await self._variable(pmc, "Holes", layout(lambda t: " ".join(f"{c},{r}" for c, r in sorted(t.holes)), ""),
                              ua.VariantType.String)
+        # Flyway_<column>_<row>: PowerConsumption (W), CpuTemperature, AmplifierTemperature and
+        # MotorTemperature (deg C), read every few seconds, NaN until they are; added at the first Reset.
+        self._flyways = await pmc.add_object(self.idx, "Flyways")
 
         # The free shuttles waiting at the loading station, the one on it first, apart by spaces:
         # the one to occupy for the next product. Empty without a loading station.
@@ -173,6 +182,40 @@ class OpcUaServer:
                              ua.VariantType.String)
         await self._variable(parent, "LineLayoutProblem", lambda: coordinator.line_problem, ua.VariantType.String)
 
+        # The zones of ZONES: the PMC's state of each (UNKNOWN until the first Reset;
+        # ACTIVATED_UNFENCED: part of the table; LOADING_FENCED: switched off, xbots may be taken
+        # off or put on) and the xbots inside; Deactivate and Activate switch it off and on.
+        await self._variable(parent, "ZoneProblem", lambda: coordinator.zone_problem, ua.VariantType.String)
+        zones = await parent.add_object(self.idx, "Zones")
+        for spec in coordinator.zone_specs:
+            name = spec.name
+            obj = await zones.add_object(self.idx, name)
+
+            def zone(read, name=name):
+                return lambda: read(coordinator.zones[name]) if name in coordinator.zones else read(None)
+
+            await self._variable(obj, "State", zone(lambda z: z.state if z else "UNKNOWN"), ua.VariantType.String)
+            await self._variable(obj, "Xbots", zone(lambda z: " ".join(str(x) for x in z.xbots) if z else ""),
+                                 ua.VariantType.String)
+            for command in ("Deactivate", "Activate"):
+                await self._method(obj, command, lambda s, c=command, n=name: self.ctl.zone_command(n, c, s),
+                                   [SESSION])
+
+    async def _add_flyways(self):
+        """The flyways' variables, once the layout is known (the first Reset)."""
+        coordinator = self.ctl.coordinator
+        with self.ctl.lock:
+            flyways = list(coordinator.layout.flyways) if coordinator.layout else []
+        for flyway in flyways:
+            if flyway in self._flyway_nodes:
+                continue
+            self._flyway_nodes.add(flyway)
+            obj = await self._flyways.add_object(self.idx, f"Flyway_{flyway[0]}_{flyway[1]}")
+            for k, name in enumerate(("PowerConsumption", "CpuTemperature", "AmplifierTemperature", "MotorTemperature")):
+                read = lambda f=flyway, k=k: float(coordinator.flyway_status[f][k]) if f in coordinator.flyway_status \
+                    else math.nan
+                await self._variable(obj, name, read, ua.VariantType.Double)
+
     async def _shuttle_equipment(self, parent, xid):
         xbot = await parent.add_object(self.idx, "Xbot")
 
@@ -187,6 +230,25 @@ class OpcUaServer:
         await self._variable(xbot, "Y", lambda: float(reading(1)), ua.VariantType.Double)
         await self._variable(xbot, "Rz", lambda: float(reading(2)), ua.VariantType.Double)
         await self._variable(xbot, "XbotState", lambda: str(reading(3)), ua.VariantType.String)
+
+        # The payload as the PMC was told it (kg, its centre of gravity mm above the xbot) and the
+        # acceleration the PMC allows with it (m/s^2; its moves keep to it): NaN while unknown.
+        # SetPayload is the occupant's, while the shuttle's skill does not run.
+        def payload(read):
+            def value():
+                agent = self.ctl.coordinator.agents.get(xid)
+                v = read(agent) if agent is not None else None
+                return math.nan if v is None else float(v)
+            return value
+
+        await self._variable(xbot, "PayloadKg", payload(lambda a: a.payload and a.payload[0]), ua.VariantType.Double)
+        await self._variable(xbot, "PayloadCgHeight", payload(lambda a: a.payload and a.payload[1] * 1000.0),
+                             ua.VariantType.Double)
+        await self._variable(xbot, "MaxAcceleration", payload(lambda a: a.max_accel), ua.VariantType.Double)
+        await self._method(xbot, "SetPayload",
+                           lambda s, kg, cg: self.ctl.set_payload(xid, s, float(kg or 0.0), float(cg or 0.0)),
+                           [SESSION, _argument("PayloadKg", ua.ObjectIds.Double, "kg"),
+                            _argument("CgHeight", ua.ObjectIds.Double, "mm above the xbot")])
 
     async def _method(self, parent, name, fn, inputs):
         async def handler(_parent, *args):
@@ -225,6 +287,9 @@ class OpcUaServer:
 
     async def _refresh(self):
         async with self._refreshing:  # one at a time, so an older snapshot never overwrites a newer
+            if self._flyways is not None and self.ctl.coordinator.layout is not None \
+                    and len(self._flyway_nodes) < len(self.ctl.coordinator.layout.flyways):
+                await self._add_flyways()
             for node, write in self._writable:
                 value = await node.read_value()
                 if not _same(value, self._last.get(node.nodeid)):  # a client wrote it

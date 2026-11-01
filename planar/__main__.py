@@ -19,8 +19,13 @@ Environment (each also an option, see --help):
   LINE_LAYOUT     line mode: the layout's JSON file, or an http(s) URL to fetch it from (e.g.
                   the $value of the line AAS's Parameters/PlanarRouting), read again at every
                   Reset of the table; its idleArea is the loading queue
-  XBOT_SPEED      m/s (0.5), XBOT_ACCEL m/s^2 (2.0)
+  ZONES           zones of the table to switch off for loading xbots on and off, or to slow
+                  down in: a JSON file or URL (see planar/zones.py); PlanarTable/Equipment/Zones
+  XBOT_SPEED      m/s (0.5), XBOT_ACCEL m/s^2 (2.0; less with a payload that allows less),
+                  XBOT_JERK m/s^3 (empty: the PMC's)
   LOG_LEVEL       INFO
+
+It stops on Ctrl+C, Ctrl+Break and SIGTERM (docker stop), and then disconnects from the PMC.
 """
 
 import argparse
@@ -29,8 +34,9 @@ import errno
 import logging
 import math
 import os
+import signal
 
-from . import lines
+from . import lines, zones
 from .coordinator import DriverError
 from .modules import PlanarController
 from .opcua_server import OpcUaServer
@@ -81,8 +87,10 @@ def parse_args():
     p.add_argument("--idle-rz", type=_quarter_deg, metavar="DEG", default=os.environ.get("IDLE_RZ", ""))
     p.add_argument("--mode", choices=("free", "line"), default=os.environ.get("MODE", "").strip().lower() or "free")
     p.add_argument("--line-layout", metavar="FILE|URL", default=os.environ.get("LINE_LAYOUT", "").strip())
+    p.add_argument("--zones", metavar="FILE|URL", default=os.environ.get("ZONES", "").strip())
     p.add_argument("--speed", type=float, default=float(os.environ.get("XBOT_SPEED", 0.5)))
     p.add_argument("--accel", type=float, default=float(os.environ.get("XBOT_ACCEL", 2.0)))
+    p.add_argument("--jerk", type=float, default=float(os.environ.get("XBOT_JERK", "").strip() or 0) or None)
     p.add_argument("--log-level", default=os.environ.get("LOG_LEVEL", "INFO"))
     args = p.parse_args()
     if args.mode not in ("free", "line"):  # from MODE: argparse checks only what is given on the command line
@@ -153,7 +161,14 @@ async def main():
         line_spec = await line_layout(args.line_layout)
     elif args.line_layout:
         log.warning("LINE_LAYOUT is set but MODE is free: the lanes are not used")
-    driver = PmcDriver(args.pmc_ip, speed=args.speed, accel=args.accel)
+    zone_specs = []
+    if args.zones:
+        try:
+            zone_specs = zones.load(args.zones)
+        except (OSError, zones.ZoneError) as e:
+            raise SystemExit(f"ZONES {args.zones}: {e}") from None
+        log.info("zones: %s", ", ".join(z.name for z in zone_specs) or "none")
+    driver = PmcDriver(args.pmc_ip, speed=args.speed, accel=args.accel, jerk=args.jerk)
     if args.shuttles.strip():
         shuttles = [int(x) for x in args.shuttles.replace(" ", "").split(",") if x]
     else:
@@ -161,7 +176,8 @@ async def main():
     ctl = PlanarController(driver, shuttles, displace_held=args.displace_held,
                            patience_s=args.blocked_timeout or None, loading_station=args.loading_station,
                            idle_rz=args.idle_rz, line_spec=line_spec,
-                           line_source=(lambda: lines.load(args.line_layout)) if line_spec else None)
+                           line_source=(lambda: lines.load(args.line_layout)) if line_spec else None,
+                           zones=zone_specs)
     server = OpcUaServer(ctl, args.endpoint)
     await server.init()
     ctl.start()
@@ -181,7 +197,15 @@ async def main():
         ctl.shutdown()
 
 
+def _interrupt(signum, frame):
+    raise KeyboardInterrupt(signal.Signals(signum).name)
+
+
 if __name__ == "__main__":
+    # Without a handler these end the process at once, without disconnecting from the PMC.
+    for name in ("SIGTERM", "SIGBREAK"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), _interrupt)
     try:
         asyncio.run(main())
     except KeyboardInterrupt:

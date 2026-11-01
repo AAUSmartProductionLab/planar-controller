@@ -36,6 +36,10 @@ area, the loading queue, for the ones nobody holds); turns are made on the turn 
 the one nearest to it, waiting behind it while another turns there, and there is no straight move
 off the lanes.
 
+A Hold pauses xbots where they are (pause, resume): nothing more is sent to a paused xbot, and
+neither its motion nor its task times out meanwhile. A zone (zones.py) switched off or fenced is
+a wall for every xbot: none is planned into it or turns in it, and a target in it is refused.
+
 Units: metres and radians.
 """
 
@@ -65,6 +69,8 @@ CLAIM_YIELD_S = 5.0
 # The PMC's auto routing takes at most this many xbots in one command.
 AUTO_DRIVE_MAX = 10
 GATHER_TIMEOUT_S = 120.0
+ZONE_READ_S = 0.5      # how often the zones' states are read from the PMC
+FLYWAY_READ_S = 5.0    # how often the flyways' power and temperatures are
 
 
 @dataclass
@@ -91,14 +97,20 @@ class DriverError(Exception):
 
 
 class Driver:
-    """What the coordinator needs from the PMC. Called from the coordinator's thread only,
-    except stop(), which an abort may call from anywhere."""
+    """What the coordinator needs from the PMC. Called from the coordinator's thread, but for
+    stop(), pause() and resume(), which a module's command may call from anywhere, and the
+    payload and the zones, which OPC UA's methods set (a driver serialises its calls).
+
+    The ones after auto_drive() are what a PMC offers besides moving: a driver without them
+    does without (the defaults)."""
 
     def connect(self):
-        """Connect, take mastership, levitate; return the Layout."""
+        """Connect, take mastership (a DriverError MASTERSHIP_LOST if another program keeps it),
+        recover the xbots the PMC switched off after an accident, levitate; return the Layout."""
         raise NotImplementedError
 
     def read(self) -> dict:
+        """{xid: Reading}; a DriverError MASTERSHIP_LOST once another program has taken mastership."""
         raise NotImplementedError
 
     def move(self, xid, x, y) -> float:
@@ -115,6 +127,46 @@ class Driver:
         """Route these xbots with the PMC's own auto routing, each to one of the targets ((x, y),
         any to any); the xbots read as moving until they are there."""
         raise NotImplementedError
+
+    def close(self):
+        """Disconnect from the PMC (the controller is stopping)."""
+
+    def pause(self, xid=0):
+        """Pause the xbot's motion where it is (0: every xbot's); it reads as idle meanwhile,
+        and motions sent meanwhile wait too."""
+        raise DriverError("this PMC cannot pause a motion")
+
+    def resume(self, xid=0):
+        """Carry on with the motions paused (0: every xbot's)."""
+        raise DriverError("this PMC cannot pause a motion")
+
+    def payload(self, xid):
+        """(kg, centre of gravity height m, max acceleration m/s^2) as the PMC has them; None: unknown."""
+        return None
+
+    def set_payload(self, xid, kg, cg_height):
+        """Tell the PMC the xbot's payload; returns the max acceleration with it (m/s^2, None:
+        unknown), which the xbot's moves keep to. DriverError OUT_OF_RANGE if it is too much."""
+        raise DriverError("this PMC does not take payloads")
+
+    def recover(self, xids):
+        """Recover these xbots if the PMC switched them off after an accident; the ones it did."""
+        return []
+
+    def define_zone(self, zid, box, speed):
+        raise DriverError("this PMC has no zones", ErrorID.ZONES_INVALID)
+
+    def zone_status(self, zid):
+        """(state, xids inside): the PMC's ZONESTATE name, e.g. ACTIVATED_UNFENCED, LOADING_FENCED."""
+        raise DriverError("this PMC has no zones")
+
+    def zone_control(self, zid, operation):
+        """deactivate (fence it, the xbots inside off), activate (levitate them) or unfence."""
+        raise DriverError("this PMC has no zones")
+
+    def flyways(self):
+        """{(column, row): (power W, CPU, amplifier, motor temperature deg C)}."""
+        return {}
 
 
 @dataclass
@@ -151,6 +203,21 @@ class Task:
 
 
 @dataclass
+class Zone:
+    id: int                        # the PMC's zone id
+    spec: object                   # zones.ZoneSpec
+    cells: frozenset               # the slots it overlaps
+    state: str = "UNKNOWN"         # the PMC's ZONESTATE name
+    xbots: tuple = ()              # inside, as the PMC says
+    activating: bool = False       # switched on: unfenced once the PMC has levitated the xbots inside
+
+    @property
+    def closed(self):
+        """Not to be entered: fenced, switched off, or on its way between."""
+        return self.state != "ACTIVATED_UNFENCED"
+
+
+@dataclass
 class Gathering:
     xids: list
     targets: list                  # slots
@@ -182,6 +249,9 @@ class Agent:
         self.turn_after = 0.0      # a turn to the idle orientation failed: not again before this
         self.ops = deque()
         self.ops_done = None
+        self.paused_at = None      # when its motion was paused (a Hold); None: not paused
+        self.payload = None        # (kg, centre of gravity height m) as last set or read; None: unknown
+        self.max_accel = None      # m/s^2 the PMC allows with it; None: unknown
 
     @property
     def present(self):
@@ -208,8 +278,14 @@ class Agent:
 class Coordinator:
     def __init__(self, driver, lock, clock=time.monotonic, *, plan_timeout=0.5, plan_budget=0.05,
                  patience_s=None, displace_held=False, loading_station=None, idle_rz=None, line_spec=None,
-                 line_source=None):
+                 line_source=None, zones=()):
         self.driver = driver
+        self.zone_specs = list(zones)  # zones.ZoneSpec, defined on the PMC at every connect
+        self.zones = {}            # name: Zone, once connected
+        self.zone_problem = ""     # why the last connect did not define the zones
+        self.flyway_status = {}    # (column, row): (power W, CPU, amplifier, motor deg C), read now and then
+        self._zones_read_at = 0.0
+        self._flyways_read_at = None
         self.line_spec = line_spec  # line mode: the lanes they travel on (see lines.py); None: free
         # line mode: () -> LineSpec, to read the layout again at every connect (a Reset); OSError
         # when it cannot be read (the one read before is used then), LineError when it is no layout.
@@ -257,6 +333,10 @@ class Coordinator:
         self._running = False
         if self._thread:
             self._thread.join(timeout=2)
+        try:
+            self.driver.close()
+        except DriverError as e:
+            log.warning("disconnecting from the PMC: %s", e)
 
     def _loop(self, period_s):
         while self._running:
@@ -279,7 +359,7 @@ class Coordinator:
             except Exception:
                 log.exception("coordinator job")
         with self.lock:
-            for hook in self.on_tick:  # the modules: their state decides who may be pushed
+            for hook in list(self.on_tick):  # the modules: their state decides who may be pushed
                 hook()
             if self.connected:
                 try:
@@ -289,6 +369,11 @@ class Coordinator:
                     readings = None
                 if readings is not None:
                     self._update(readings, now)
+                    if self.zones and now - self._zones_read_at >= ZONE_READ_S:
+                        self._read_zones(now)
+                    if self._flyways_read_at is None or now - self._flyways_read_at >= FLYWAY_READ_S:
+                        self._flyways_read_at = now
+                        self.run_job(self._read_flyways)
                     if self._gathering is not None and self._gathering.routing:
                         self._advance_gathering(now)  # the PMC drives them: nothing else moves
                         return
@@ -330,7 +415,27 @@ class Coordinator:
                 lines = Lines(spec, layout)
             except LineError as e:
                 return self._layout_invalid(f"the line layout does not fit the table: {e}")
+        zones = {}
+        for zid, zone in enumerate(self.zone_specs, start=1):
+            x0, y0, x1, y1 = zone.box
+            cells = layout.cells_in(zone.box)
+            if x0 < -EXACT_M or y0 < -EXACT_M or x1 > layout.width + EXACT_M or y1 > layout.height + EXACT_M or not cells:
+                return self._zones_invalid(f"zone {zone.name} is not on the table ({layout.width * 1000:.0f} x "
+                                           f"{layout.height * 1000:.0f} mm)")
+            try:
+                self.driver.define_zone(zid, zone.box, zone.speed)
+                state, inside = self.driver.zone_status(zid)
+            except DriverError as e:
+                return self._zones_invalid(f"zone {zone.name}: {e}")
+            zones[zone.name] = Zone(zid, zone, cells, state, tuple(inside))
+        payloads = {}
+        for xid in readings:
+            try:
+                payloads[xid] = self.driver.payload(xid)
+            except DriverError as e:
+                log.warning("xbot %d: reading its payload: %s", xid, e)
         with self.lock:
+            self.zones, self.zone_problem = zones, ""
             if spec is not None and self.line_spec is not None and spec.text != self.line_spec.text:
                 log.info("line mode: the line layout has changed since it was read before")
             self.line_spec, self.line_problem = spec, problem
@@ -341,6 +446,10 @@ class Coordinator:
             # Every xbot on the table takes part, whether it is offered as a shuttle or not.
             for xid in set(readings) | set(xids or ()):
                 self.agents.setdefault(xid, Agent(xid))
+            for xid, known in payloads.items():
+                if known is not None:
+                    kg, cg, max_accel = known
+                    self.agents[xid].payload, self.agents[xid].max_accel = (kg, cg), max_accel
             self.connected = True
             self._signature = None
             if lines:
@@ -363,16 +472,29 @@ class Coordinator:
                 log.info("table slots:\n%s", layout.describe())
             if self.queue:
                 log.info("loading queue: %s", self.queue[:len(self.agents)])
+            for name, zone in zones.items():
+                log.info("zone %s (%d): slots %s, %s%s", name, zone.id, sorted(zone.cells), zone.state,
+                         f", speed x{zone.spec.speed:g}" if zone.spec.speed != 1 else "")
         return ErrorID.NONE
 
+    def _zones_invalid(self, problem):
+        log.error("%s", problem)
+        self.zone_problem = problem
+        return ErrorID.ZONES_INVALID
+
     def _lost(self, error):
-        log.error("PMC connection lost: %s", error)
+        if error.code == ErrorID.MASTERSHIP_LOST:
+            log.error("%s", error)
+        else:
+            log.error("PMC connection lost: %s", error)
+            error.code = ErrorID.PMC_NOT_CONNECTED
         self.connected = False
         self._gathering = None
         for agent in self.agents.values():
-            self._drop(agent, ErrorID.PMC_NOT_CONNECTED)
+            agent.paused_at = None
+            self._drop(agent, error.code)
         if self.on_connection_lost:
-            self.on_connection_lost()
+            self.on_connection_lost(error.code)
 
     # --- commands (from the modules, with the lock held) -------------------------------------
 
@@ -388,6 +510,8 @@ class Coordinator:
             return ErrorID.ANGLE_NOT_ALLOWED
         if not self.layout.on_table(target.x, target.y, target.rz):
             return ErrorID.NOT_ON_TABLE
+        if self.layout.footprint(target.x, target.y, target.rz) & self._closed_cells():
+            return ErrorID.ZONE_CLOSED
         if not is_square_aligned(agent.pose.rz) and agent.cell is None \
                 and self.layout.spot_at(agent.pose.x, agent.pose.y) is None:
             return ErrorID.XBOT_CROOKED
@@ -438,7 +562,11 @@ class Coordinator:
         self._new_task(agent, Pose(*self.layout.center(agent.cell), self.idle_rz), finished, internal=True)
 
     def halt(self, xid):
+        """Finish where its motion ends, the task failed with Interrupted (a paused motion
+        carries on first)."""
         agent = self.agents.get(xid)
+        if agent and agent.paused_at is not None:
+            self.resume(xid)
         if agent and agent.task:
             agent.task.halting = True
 
@@ -451,6 +579,8 @@ class Coordinator:
             self.driver.stop(xid)
         except DriverError as e:
             log.error("xbot %d: stop: %s", xid, e)
+        if agent.paused_at is not None:
+            self.resume(xid)  # else the motions sent later would wait too
         agent.task = None
         self._clear_motion(agent)
 
@@ -460,6 +590,8 @@ class Coordinator:
             self.driver.stop(0)
         except DriverError as e:
             log.error("stop all: %s", e)
+        if any(a.paused_at is not None for a in self.agents.values()):
+            self.resume()
         for agent in self.agents.values():
             agent.task = None
             self._clear_motion(agent)
@@ -468,6 +600,179 @@ class Coordinator:
         agent = self.agents.get(xid)
         if agent is not None:
             agent.held = held
+
+    # --- pausing (a module's Hold) -----------------------------------------------------------
+
+    def pause(self, xid=None) -> ErrorID:
+        """Pause the xbot's motion where it is (None: every xbot's): nothing it does goes on and
+        nothing new is sent to it, its task does not time out, until resume()."""
+        if not self.connected:
+            return ErrorID.PMC_NOT_CONNECTED
+        agents = list(self.agents.values()) if xid is None else [self.agents[xid]] if xid in self.agents else []
+        try:
+            self.driver.pause(xid or 0)
+        except DriverError as e:
+            log.error("pausing %s: %s", f"xbot {xid}" if xid else "every xbot", e)
+            return e.code
+        now = self.clock()
+        for agent in agents:
+            if agent.paused_at is None:
+                agent.paused_at = now
+        log.info("%s paused", f"xbot {xid}" if xid else "every xbot")
+        return ErrorID.NONE
+
+    def resume(self, xid=None) -> ErrorID:
+        """Carry on where pause() stopped (None: every xbot); the time paused does not count."""
+        agents = [a for a in (self.agents.values() if xid is None else [self.agents.get(xid)])
+                  if a is not None and a.paused_at is not None]
+        error = ErrorID.NONE
+        if self.connected:
+            try:
+                self.driver.resume(xid or 0)
+            except DriverError as e:
+                log.error("resuming %s: %s", f"xbot {xid}" if xid else "every xbot", e)
+                error = e.code
+        now = self.clock()
+        for agent in agents:
+            dt, agent.paused_at = now - agent.paused_at, None
+            if agent.motion is not None:
+                agent.motion.sent += dt
+            if agent.task is not None:
+                agent.task.progress_at += dt
+                agent.task.claim_after += dt
+            agent.zone_since += dt
+            agent.turn_after += dt
+        if agents:
+            log.info("%s resumed", f"xbot {xid}" if xid else "every xbot")
+        return error
+
+    # --- the payload -------------------------------------------------------------------------
+
+    def set_payload(self, xid, kg, cg_height) -> ErrorID:
+        """Tell the PMC what the xbot carries (kg, its centre of gravity's height above the xbot,
+        m); it then keeps the xbot's moves to the acceleration the PMC allows with it. Not while
+        it moves."""
+        if not self.connected:
+            return ErrorID.PMC_NOT_CONNECTED
+        agent = self.agents.get(xid)
+        if agent is None or not agent.present:
+            return ErrorID.XBOT_NOT_DETECTED
+        if agent.motion is not None or agent.ops or agent.actions or agent.paused_at is not None:
+            return ErrorID.BUSY
+        try:
+            max_accel = self.driver.set_payload(xid, kg, cg_height)
+        except DriverError as e:
+            log.error("xbot %d: payload %.3f kg: %s", xid, kg, e)
+            return e.code
+        agent.payload, agent.max_accel = (kg, cg_height), max_accel
+        log.info("xbot %d: payload %.3f kg, centre of gravity %.0f mm up%s", xid, kg, cg_height * 1000,
+                 f"; max acceleration {max_accel:g} m/s^2" if max_accel is not None else "")
+        return ErrorID.NONE
+
+    # --- accidents ---------------------------------------------------------------------------
+
+    def recover(self, xid) -> bool:
+        """Recover the xbot if the PMC switched it off after an accident; whether it did."""
+        try:
+            recovered = xid in self.driver.recover([xid])
+        except DriverError as e:
+            log.error("xbot %d: recovering it after an accident: %s", xid, e)
+            return False
+        if recovered:
+            log.info("xbot %d: recovered after an accident", xid)
+        return recovered
+
+    # --- zones -------------------------------------------------------------------------------
+
+    def _closed_cells(self):
+        return frozenset().union(*[z.cells for z in self.zones.values() if z.closed])
+
+    def _closed_boxes(self):
+        return [z.spec.box for z in self.zones.values() if z.closed]
+
+    def deactivate_zone(self, name) -> ErrorID:
+        """Switch the zone off: the PMC fences it and switches off the xbots inside, which may
+        then be taken off the table, or new ones put on. Only while it is switched on and no
+        xbot is on its way into, out of or across it, or stands across its edge."""
+        zone = self.zones.get(name)
+        if not self.connected or zone is None:
+            return ErrorID.PMC_NOT_CONNECTED
+        if zone.closed:
+            return ErrorID.NOT_READY
+        for agent in self.agents.values():
+            if not agent.present:
+                continue
+            inside = agent.footprint & zone.cells
+            if inside and inside != agent.footprint:
+                log.info("zone %s: xbot %d stands across its edge", name, agent.xid)
+                return ErrorID.BUSY
+            on_the_way = (agent.motion is not None or agent.ops or agent.task is not None) and inside
+            planned = any(a.to in zone.cells or a.frm in zone.cells for a in agent.actions)
+            flying = agent.flying and any(a.to in zone.cells for a in agent.motion.actions)
+            going = agent.task is not None and self._target_cells(agent.task) & zone.cells
+            claim = agent.zone and agent.zone & zone.cells
+            if on_the_way or planned or flying or going or claim:
+                log.info("zone %s: xbot %d is on its way in, out or across", name, agent.xid)
+                return ErrorID.BUSY
+        try:
+            self.driver.zone_control(zone.id, "deactivate")
+        except DriverError as e:
+            log.error("zone %s: switching it off: %s", name, e)
+            return e.code
+        zone.state, zone.activating = "DEACTIVATING", False
+        self._signature = None
+        log.info("zone %s: switched off (xbots inside %s)", name,
+                 sorted(a.xid for a in self.agents.values() if a.present and a.footprint & zone.cells))
+        return ErrorID.NONE
+
+    def activate_zone(self, name) -> ErrorID:
+        """Switch the zone on again: the PMC levitates the xbots inside, then it is unfenced."""
+        zone = self.zones.get(name)
+        if not self.connected or zone is None:
+            return ErrorID.PMC_NOT_CONNECTED
+        if zone.state == "ACTIVATED_UNFENCED":
+            return ErrorID.NOT_READY
+        try:
+            if zone.state in ("ACTIVATED_FENCED",):
+                self.driver.zone_control(zone.id, "unfence")
+            else:
+                self.driver.zone_control(zone.id, "activate")
+        except DriverError as e:
+            log.error("zone %s: switching it on: %s", name, e)
+            return e.code
+        zone.activating = True
+        log.info("zone %s: switched on", name)
+        return ErrorID.NONE
+
+    def _read_zones(self, now):
+        self._zones_read_at = now
+        for name, zone in self.zones.items():
+            try:
+                state, inside = self.driver.zone_status(zone.id)
+            except DriverError as e:
+                log.debug("zone %s: %s", name, e)
+                continue
+            if zone.activating and state == "ACTIVATED_FENCED":
+                try:
+                    self.driver.zone_control(zone.id, "unfence")
+                except DriverError as e:
+                    log.error("zone %s: removing its fence: %s", name, e)
+            if state == "ACTIVATED_UNFENCED":
+                zone.activating = False
+            if state != zone.state:
+                log.info("zone %s: %s, xbots inside %s", name, state, sorted(inside))
+                self._signature = None
+            zone.state, zone.xbots = state, tuple(inside)
+
+    def _read_flyways(self):
+        """(a job: without the lock, the PMC asked once for each flyway)"""
+        try:
+            status = self.driver.flyways()
+        except DriverError as e:
+            log.debug("reading the flyways: %s", e)
+            return
+        with self.lock:
+            self.flyway_status = status
 
     def check_xbot(self, xid, clear=True) -> ErrorID:
         """Whether the xbot is there and fit to move; with clear, forgets an earlier fault if it is."""
@@ -536,6 +841,7 @@ class Coordinator:
             agent.task = None
             self._clear_motion(agent)
         others = frozenset().union(*[a.footprint for a in self.agents.values() if a.present and a not in agents])
+        others |= self._closed_cells()
         targets = [s for s in self.queue if s not in others][:len(agents)]
         self._gathering = Gathering([a.xid for a in agents], targets, self.clock(), done, routing=False)
         if not targets or {a.cell for a in agents} == set(targets):
@@ -602,6 +908,10 @@ class Coordinator:
     # --- reading the table -------------------------------------------------------------------
 
     def _update(self, readings, now):
+        for xid in readings.keys() - self.agents.keys():  # put on the table in a zone switched off
+            log.info("xbot %d is new on the table", xid)
+            self.agents[xid] = Agent(xid)
+            self._signature = None
         for xid, agent in self.agents.items():
             r = readings.get(xid)
             if r is None:
@@ -614,6 +924,9 @@ class Coordinator:
             if r.state == "fault" and agent.fault is None:
                 log.error("xbot %d: %s", xid, r.detail)
                 self._fail(agent, ErrorID.XBOT_FAULT)
+            elif r.state == "off" and (agent.motion or agent.ops or agent.task):
+                log.error("xbot %d: switched off (%s) on its way", xid, r.detail)
+                self._fail(agent, ErrorID.XBOT_NOT_DETECTED)
             if agent.motion is None and not agent.ops:
                 self._classify(agent)
 
@@ -633,8 +946,8 @@ class Coordinator:
     def _advance_motions(self, now):
         for agent in self.agents.values():
             m = agent.motion
-            if m is None or agent.pose is None:
-                continue
+            if m is None or agent.pose is None or agent.paused_at is not None:
+                continue  # (paused, it reads as idle where it stopped)
             p = agent.pose
             if m.kind == "nav":
                 along = (p.x - m.origin[0]) * m.direction[0] + (p.y - m.origin[1]) * m.direction[1]
@@ -670,6 +983,8 @@ class Coordinator:
     def _advance_tasks(self, now):
         for agent in self.agents.values():
             task = agent.task
+            if agent.paused_at is not None:
+                continue
             if task is None:
                 agent.want = None
                 if (agent.present and not agent.fault and agent.motion is None and not agent.ops
@@ -811,7 +1126,7 @@ class Coordinator:
         if not is_square_aligned(p.rz):
             return False
         box = hull(self.layout.square(p.x, p.y, p.rz), self.layout.square(t.x, t.y, t.rz))
-        if not self.layout.footprint_of(box) <= self.layout.cells:
+        if not self.layout.footprint_of(box) <= self.layout.cells - self._closed_cells():
             return False
         if len(self.layout.cells_in(box)) > DIRECT_MAX_SLOTS:
             return False
@@ -865,7 +1180,8 @@ class Coordinator:
                 if o is not agent and self._is_wall(o)]
 
     def _claims(self, agent):
-        return [b for o in self.agents.values() if o is not agent for b in o.zone_boxes]
+        """Others' claims, and the zones closed: boxes nothing may sweep."""
+        return [b for o in self.agents.values() if o is not agent for b in o.zone_boxes] + self._closed_boxes()
 
     def _turn_here(self, agent, spot, rz):
         """Turn on the spot it stands on, once its neighbours are clear of the turn."""
@@ -1011,6 +1327,8 @@ class Coordinator:
         boxes = tuple(boxes)
         if agent.zone_boxes == boxes and not immediate:
             return True  # held already (an immediate claim is always checked afresh)
+        if any(overlap(z, b) for z in self._closed_boxes() for b in boxes):
+            return False
         cells = frozenset().union(*(self.layout.cells_in(b) for b in boxes))
         waiting = False  # another claim is waiting for its zone to clear
         for other in self.agents.values():
@@ -1088,6 +1406,8 @@ class Coordinator:
     def _is_mover(self, agent):
         if not agent.present or agent.fault or agent.cell is None or agent.in_macro:
             return False
+        if agent.cell in self._closed_cells():
+            return False  # fenced in
         return agent.task is not None or not self._held(agent)
 
     def _held(self, agent):
@@ -1104,7 +1424,7 @@ class Coordinator:
         return agent.pose is not None and not self._is_mover(agent)
 
     def _walls(self, exclude=None):
-        walls = set()
+        walls = set(self._closed_cells())
         for other in self.agents.values():
             if other is not exclude and self._is_wall(other):
                 walls |= other.footprint
@@ -1116,7 +1436,7 @@ class Coordinator:
 
     def _static_distance(self, agent, cell, toward, around_walls=True):
         """Steps from cell to the nearest of toward, around walls only (in line mode: on the lanes)."""
-        free = self.layout.cells - (self._walls(exclude=agent) if around_walls else set())
+        free = self.layout.cells - (self._walls(exclude=agent) if around_walls else self._closed_cells())
         toward = set(toward)
         if cell in toward:
             return 0
@@ -1159,8 +1479,9 @@ class Coordinator:
             fixed, candidates = True, self.lines.turn_spots
         else:
             fixed, candidates = False, [layout.flyway_center(f) for f in layout.flyways]
-        blocked = [] if fixed else [layout.square(o.pose.x, o.pose.y, o.pose.rz) for o in self.agents.values()
-                                    if o is not agent and self._is_wall(o)] + self._claims(agent)
+        blocked = self._closed_boxes() if fixed else [layout.square(o.pose.x, o.pose.y, o.pose.rz)
+                                                      for o in self.agents.values()
+                                                      if o is not agent and self._is_wall(o)] + self._claims(agent)
         best, best_cost = None, (mapf.INF, mapf.INF)
         for spot in candidates:
             if any(overlap(layout.spot_box(spot), b) for b in blocked):
@@ -1409,7 +1730,7 @@ class Coordinator:
 
     def _dispatch(self, now):
         for agent in self.agents.values():
-            if agent.motion is not None or agent.fault:
+            if agent.motion is not None or agent.fault or agent.paused_at is not None:
                 continue
             if agent.ops:
                 if agent.zone is None or self._zone_clear(agent):

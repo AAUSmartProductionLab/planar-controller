@@ -6,13 +6,20 @@ and where four flyways meet (the PMC refuses rotation anywhere else). The PMC's 
 planner, every xbot stepping from slot to slot at the same pace. Time is whatever the caller says
 it is (advance()), so tests run faster than real time. Every overlap of two xbots is recorded as
 a collision.
+
+As the Planar Motor simulator does: a paused xbot reads as idle where it stopped, and a motion
+sent to it waits too; a payload over MAX_PAYLOAD_KG is refused; the xbots in a zone switched off
+read as off. An accident (accident(xid)) switches an xbot off until it is recovered.
 """
 
 import math
 
 from . import mapf
 from .coordinator import Driver, DriverError, Reading
-from .layout import POSITION_TOLERANCE_M, wrap_angle
+from .layout import POSITION_TOLERANCE_M, overlap, wrap_angle
+from .statemachines import ErrorID
+
+MAX_PAYLOAD_KG = 0.5  # an M3-06's, as the simulator takes it
 
 OVERLAP_TOLERANCE_M = 0.0005
 
@@ -47,6 +54,10 @@ class SimXbot:
         self.x, self.y, self.rz = x, y, rz
         self.motion = None  # (kind, start, target, t0, total, distance)
         self.fault = None
+        self.paused = False
+        self.off = False    # switched off: in a zone switched off, or after an accident
+        self.accident = False
+        self.payload = (0.0, 0.0)
 
 
 class SimDriver(Driver):
@@ -60,31 +71,50 @@ class SimDriver(Driver):
         self.commands = []
         self.turns = []  # (xid, how far it turned, rad, + counterclockwise)
         self.auto = None  # auto routing in progress: (xids, stages, poses, t0)
+        self.zones = {}   # zid: [box, speed, state]
+        self.max_accel = lambda kg: 20.0  # m/s^2 with a payload of kg (the simulator's: always 20)
+        self.flyway_status = {}
+        self.master = True  # False: another program has taken mastership
+        self.closed = False
 
     # --- Driver --------------------------------------------------------------------------
 
     def connect(self):
+        if not self.master:
+            raise DriverError("another program is the PMC's master", ErrorID.MASTERSHIP_LOST)
+        self.recover(list(self.xbots))
+        for xb in self.xbots.values():
+            xb.paused = False
+        self.closed = False
         return self.layout
 
     def read(self):
+        if not self.master:
+            raise DriverError("another program has taken mastership of the PMC", ErrorID.MASTERSHIP_LOST)
         out = {}
         for xid, xb in self.xbots.items():
-            if xb.fault:
-                state = "fault"
-            elif xb.motion:
-                state = "moving"
+            if xb.off:
+                state, detail = "off", "ACCIDENT (XBOT_DISABLED)" if xb.accident else "XBOT_DISABLED"
+            elif xb.fault:
+                state, detail = "fault", xb.fault
+            elif xb.motion and not xb.paused:
+                state, detail = "moving", ""
             else:
-                state = "idle"
-            out[xid] = Reading(xb.x, xb.y, xb.rz, state, xb.fault or "")
+                state, detail = "idle", ""
+            out[xid] = Reading(xb.x, xb.y, xb.rz, state, detail)
         return out
+
+    def _accel(self, xb):
+        return min(self.accel, self.max_accel(xb.payload[0]))
 
     def move(self, xid, x, y):
         xb = self._ready(xid)
         if not self.layout.on_table(x, y, xb.rz):
             raise DriverError(f"xbot {xid}: ({x}, {y}) is off the table")
         distance = math.hypot(x - xb.x, y - xb.y)
-        total = _travel_time(distance, self.speed, self.accel)
-        xb.motion = ("move", (xb.x, xb.y), (x, y), self.now, total, distance)
+        accel = self._accel(xb)
+        total = _travel_time(distance, self.speed, accel)
+        xb.motion = ("move", (xb.x, xb.y), (x, y), self.now, total, distance, accel)
         self.commands.append((self.now, xid, "move", x, y))
         return total
 
@@ -95,7 +125,7 @@ class SimDriver(Driver):
         turn = wrap_angle(rz - xb.rz)  # the shortest way, as PmcDriver turns
         distance = abs(turn)
         total = _travel_time(distance, self.turn_speed, self.turn_accel)
-        xb.motion = ("rotate", xb.rz, xb.rz + turn, self.now, total, distance)
+        xb.motion = ("rotate", xb.rz, xb.rz + turn, self.now, total, distance, self.turn_accel)
         self.turns.append((xid, turn))
         self.commands.append((self.now, xid, "rotate", rz))
         return total
@@ -165,12 +195,98 @@ class SimDriver(Driver):
             self.xbots[xid].motion = ("auto",)
         self.commands.append((self.now, 0, "auto", tuple(xids), tuple(targets)))
 
+    def close(self):
+        self.closed = True
+
+    def _each(self, xid):
+        return [self.xbots[xid]] if xid else list(self.xbots.values())
+
+    def pause(self, xid=0):
+        if xid and xid not in self.xbots:
+            raise DriverError(f"xbot {xid} not detected")
+        for xb in self._each(xid):
+            xb.paused = True
+        self.commands.append((self.now, xid, "pause"))
+
+    def resume(self, xid=0):
+        for xb in self._each(xid):
+            xb.paused = False
+        self.commands.append((self.now, xid, "resume"))
+
+    def payload(self, xid):
+        xb = self.xbots[xid]
+        return (*xb.payload, self.max_accel(xb.payload[0]))
+
+    def set_payload(self, xid, kg, cg_height):
+        if kg > MAX_PAYLOAD_KG:
+            raise DriverError("write_xbot_payload_settings command failed with code INVALIDPARAMS", ErrorID.OUT_OF_RANGE)
+        xb = self.xbots[xid]
+        xb.payload = (kg, cg_height)
+        return self.max_accel(kg)
+
+    def accident(self, xid):
+        """The xbot hit something: it stops and the PMC switches it off."""
+        xb = self.xbots[xid]
+        xb.motion, xb.off, xb.accident = None, True, True
+
+    def recover(self, xids):
+        out = []
+        for xid in xids:
+            xb = self.xbots.get(xid)
+            if xb is not None and xb.accident:
+                xb.off = xb.accident = False
+                out.append(xid)
+        return out
+
+    def define_zone(self, zid, box, speed):
+        state = self.zones.get(zid, [None, None, "ACTIVATED_UNFENCED"])[2]
+        self.zones[zid] = [tuple(box), speed, state]
+
+    def _inside(self, box):
+        return [xid for xid, xb in self.xbots.items()
+                if overlap(self.layout.square(xb.x, xb.y, xb.rz), box)]
+
+    def zone_status(self, zid):
+        box, _, state = self.zones[zid]
+        return state, self._inside(box)
+
+    def zone_control(self, zid, operation):
+        zone = self.zones[zid]
+        box = zone[0]
+        if operation == "deactivate":
+            zone[2] = "LOADING_FENCED"
+            for xid in self._inside(box):
+                self.xbots[xid].off = True
+        elif operation == "activate":
+            zone[2] = "ACTIVATED_FENCED"
+            for xid in self._inside(box):
+                if not self.xbots[xid].accident:
+                    self.xbots[xid].off = False
+        elif operation == "unfence":
+            if zone[2] != "ACTIVATED_FENCED":
+                raise DriverError(f"zone {zid} is {zone[2]}")
+            zone[2] = "ACTIVATED_UNFENCED"
+
+    def flyways(self):
+        return dict(self.flyway_status)
+
     # --- simulation ----------------------------------------------------------------------
+
+    def put(self, xid, x, y, rz=0.0):
+        """Put an xbot on the table (by hand, in a zone switched off); it is off until the zone is on."""
+        xb = self.xbots[xid] = SimXbot(x, y, rz)
+        xb.off = True
+
+    def take(self, xid):
+        """Take an xbot off the table."""
+        del self.xbots[xid]
 
     def _ready(self, xid):
         xb = self.xbots.get(xid)
         if xb is None:
             raise DriverError(f"xbot {xid} not detected")
+        if xb.off:
+            raise DriverError(f"xbot {xid} is switched off")
         if xb.fault:
             raise DriverError(f"xbot {xid}: {xb.fault}")
         if xb.motion:
@@ -178,19 +294,22 @@ class SimDriver(Driver):
         return xb
 
     def advance(self, now):
-        self.now = now
+        dt, self.now = now - self.now, now
         if self.auto:
             self._advance_auto(now)
         for xb in self.xbots.values():
             if not xb.motion or xb.motion[0] == "auto":
                 continue
-            kind, start, target, t0, total, distance = xb.motion
+            kind, start, target, t0, total, distance, accel = xb.motion
+            if xb.paused:  # the time paused does not count
+                xb.motion = (kind, start, target, t0 + dt, total, distance, accel)
+                continue
             if kind == "move":
-                f = _fraction(now - t0, total, distance, self.speed, self.accel)
+                f = _fraction(now - t0, total, distance, self.speed, accel)
                 xb.x = start[0] + (target[0] - start[0]) * f
                 xb.y = start[1] + (target[1] - start[1]) * f
             else:
-                f = _fraction(now - t0, total, distance, self.turn_speed, self.turn_accel)
+                f = _fraction(now - t0, total, distance, self.turn_speed, accel)
                 xb.rz = start + (target - start) * f
             if f >= 1.0:
                 if kind == "rotate":

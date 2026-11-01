@@ -5,8 +5,10 @@ module"):
 - Occupation: Occupy/Release(Session). A client picks a UUID, occupies with it, and every
   command it sends carries it. Whether the module is occupied is published, the session never.
 - Module: the PackML state manager. Stopped -Reset-> Resetting {procedure} -> Idle -Start->
-  Execute (stays while the occupant runs skills); Stop -> Stopping (the skills started over
-  OPC UA stop, wait until none is active, Stopping procedure) -> Stopped; Abort -> Aborted
+  Execute (stays while the occupant runs skills); Execute -Hold-> Holding {procedure} -> Held
+  (the skills running stay Running, paused) -Unhold-> Unholding {procedure} -> Execute; Stop ->
+  Stopping (from Holding, Held or Unholding the equipment carries on first; the skills started
+  over OPC UA stop, wait until none is active, Stopping procedure) -> Stopped; Abort -> Aborted
   (skills and equipment off) -Clear-> Stopped.
 - Skill: the skill core. Idle 0, Running 1, Stopping 2, Succeeded 3, Failed 4, Aborted 5. Start
   from Idle, Succeeded or Failed; Succeeded returns to Idle by itself after 1.5 s, Failed stays;
@@ -51,6 +53,9 @@ class ErrorID(IntEnum):
     XBOT_CROOKED = 29       # turned off the axes away from a flyway centre: it cannot travel
     MOTION_DEVIATED = 30    # a move ended somewhere else than it was sent
     LINE_LAYOUT_INVALID = 31  # line mode: the line layout is none or does not fit the table (LineLayoutProblem)
+    MASTERSHIP_LOST = 32    # another program (PMT, another controller) has taken mastership of the PMC
+    ZONE_CLOSED = 33        # the target is in a zone that is switched off or fenced (Equipment/Zones)
+    ZONES_INVALID = 34      # a zone of ZONES is not on the table, or the PMC would not define it
 
 
 class SkillState(IntEnum):
@@ -72,7 +77,13 @@ class ModuleState(IntEnum):
     STOPPING = 7
     ABORTING = 8
     ABORTED = 9
+    HOLDING = 10
+    HELD = 11
+    UNHOLDING = 12
     RESETTING = 15
+
+
+_HOLD_STATES = (ModuleState.HOLDING, ModuleState.HELD, ModuleState.UNHOLDING)
 
 
 Answer = tuple[bool, ErrorID]
@@ -296,11 +307,17 @@ class Module:
     The PackML state manager of one module, with its occupation and skills.
 
     A module may have a parent (the table is the shuttles' parent): the parent's Stop and Abort
-    reach every child, its Reset, Start and Clear the children in the matching state, and a
-    child's skills run only while the parent is in Execute too.
+    reach every child, its Reset, Start, Hold, Unhold and Clear the children in the matching
+    state, and a child's skills run only while the parent is in Execute too. A child may be held
+    on its own; it is unheld only while its parent is in Execute.
+
+    Holding and Unholding run their procedures (pause and resume the equipment); one that fails
+    aborts the module with its error. resuming is called when a Stop takes the module out of
+    Holding, Held or Unholding, so the equipment carries on and the skills can stop in order.
     """
 
-    def __init__(self, name, lock, clock, resetting=None, stopping=None, aborting=None, parent=None):
+    def __init__(self, name, lock, clock, resetting=None, stopping=None, aborting=None, parent=None,
+                 holding=None, unholding=None, resuming=None):
         self.name = name
         self._lock = lock
         self.clock = clock
@@ -315,6 +332,9 @@ class Module:
         self._resetting = resetting or Procedure()
         self._stopping = stopping or Procedure()
         self._aborting = aborting or (lambda: None)
+        self._holding = holding or Procedure()
+        self._unholding = unholding or Procedure()
+        self._resuming = resuming or (lambda: None)
         self._procedure_run = 0
         self._stopping_procedure_started = False
         self.listeners = []  # called with the module after every state or occupation change
@@ -339,6 +359,8 @@ class Module:
             return {
                 "Reset": self.reset,
                 "Start": self.start,
+                "Hold": self.hold,
+                "Unhold": self.unhold,
                 "Stop": self.stop,
                 "Abort": self.abort,
                 "Clear": self.clear,
@@ -368,11 +390,40 @@ class Module:
             self._notify()
             return OK
 
+    def hold(self) -> Answer:
+        with self._lock:
+            if self.state != ModuleState.EXECUTE:
+                return refuse(ErrorID.NOT_READY)
+            self._set(ModuleState.HOLDING)
+            for child in self.children:
+                if child.state == ModuleState.EXECUTE:
+                    child.hold()
+            self._run_procedure(self._holding, self._hold_done)
+            self._notify()
+            return OK
+
+    def unhold(self) -> Answer:
+        with self._lock:
+            if self.state != ModuleState.HELD:
+                return refuse(ErrorID.NOT_READY)
+            if self.parent is not None and self.parent.state not in (ModuleState.EXECUTE, ModuleState.UNHOLDING):
+                return refuse(ErrorID.NOT_READY)
+            self._set(ModuleState.UNHOLDING)
+            self._run_procedure(self._unholding, self._unhold_done)
+            self._notify()
+            return OK
+
     def stop(self) -> Answer:
         with self._lock:
-            if self.state not in (ModuleState.IDLE, ModuleState.STARTING, ModuleState.EXECUTE, ModuleState.RESETTING):
+            if self.state not in (ModuleState.IDLE, ModuleState.STARTING, ModuleState.EXECUTE, ModuleState.RESETTING,
+                                  *_HOLD_STATES):
                 return refuse(ErrorID.NOT_READY)
-            self._procedure_run += 1  # a Resetting still running is dropped
+            if self.state in _HOLD_STATES:
+                try:
+                    self._resuming()
+                except Exception:
+                    log.exception("%s: resuming", self.name)
+            self._procedure_run += 1  # a Resetting, Holding or Unholding still running is dropped
             self._set(ModuleState.STOPPING)
             self._stopping_procedure_started = False
             for skill in self.skills.values():
@@ -467,6 +518,29 @@ class Module:
         for child in self.children:
             if child.state == ModuleState.STOPPED:
                 child.reset()
+        self._notify()
+
+    def _hold_done(self, ok, error):
+        if self.state != ModuleState.HOLDING:
+            return
+        if not ok:
+            log.error("%s: holding failed (%s)", self.name, ErrorID(error or ErrorID.PROCEDURE_FAILED).name)
+            self.fail(error or ErrorID.PROCEDURE_FAILED)
+            return
+        self._set(ModuleState.HELD)
+        self._notify()
+
+    def _unhold_done(self, ok, error):
+        if self.state != ModuleState.UNHOLDING:
+            return
+        if not ok:
+            log.error("%s: unholding failed (%s)", self.name, ErrorID(error or ErrorID.PROCEDURE_FAILED).name)
+            self.fail(error or ErrorID.PROCEDURE_FAILED)
+            return
+        self._set(ModuleState.EXECUTE)
+        for child in self.children:
+            if child.state == ModuleState.HELD:
+                child.unhold()
         self._notify()
 
     def _stop_done(self, ok, error):

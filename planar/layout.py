@@ -225,8 +225,7 @@ class Layout:
         return "\n".join(lines)
 
 
-def parse_pmc_config(path):
-    """The table layout from a configuration the PMC saved (save_pmc_config_xml_file)."""
+def _pmc_flyways(path):
     with open(path, "rb") as f:
         content = f.read().replace(b"\x00", b"").decode("ISO-8859-1").strip()
     root = ET.fromstring(content)
@@ -236,10 +235,23 @@ def parse_pmc_config(path):
     cols = int(layout.findtext("mcol"))
     rows = int(layout.findtext("mrow"))
     mapping = layout.find("mapping")
-    present = set()
+    order = []
     if mapping is not None:
         col_values = [int(v.text) for v in mapping.find("col").findall("value")]
         row_values = [int(v.text) for v in mapping.find("row").findall("value")]
-        present = set(zip(col_values, row_values))
+        order = list(zip(col_values, row_values))
+    return cols, rows, order
+
+
+def parse_pmc_config(path):
+    """The table layout from a configuration the PMC saved (save_pmc_config_xml_file)."""
+    cols, rows, order = _pmc_flyways(path)
+    present = set(order)
     holes = frozenset((c, r) for c in range(cols) for r in range(rows) if (c, r) not in present)
     return Layout(cols=cols, rows=rows, holes=holes)
+
+
+def pmc_flyway_ids(path):
+    """{(column, row): the PMC's flyway id}: the flyways numbered from 1 in the order of the
+    configuration's mapping."""
+    return {flyway: k for k, flyway in enumerate(_pmc_flyways(path)[2], start=1)}

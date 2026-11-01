@@ -29,6 +29,10 @@ below, and prints a line, PASS or FAIL:
 PASS clockwise-outwards (83 s): 9 products: 8 finished, 1 discarded; ...; 39 lane steps; turns 1x -180 deg, 34x -90 deg; 0 problems
 ```
 
+`--hold-every 8` holds the table every 8 s during the scenario (nothing may move while it is
+held); `--mastership` then takes mastership from another session (the table must abort with
+MastershipLost and take it back at a Reset).
+
 Against a controller you run yourself, from the repository's root:
 
 ```sh
