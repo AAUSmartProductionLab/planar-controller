@@ -105,6 +105,7 @@ class Driver:
         raise NotImplementedError
 
     def rotate(self, xid, rz) -> float:
+        """Turn to rz the shortest way (by at most half a turn)."""
         raise NotImplementedError
 
     def stop(self, xid=0):

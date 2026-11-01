@@ -16,7 +16,7 @@ from pmclib import system_commands as sys_cmd
 from pmclib import xbot_commands as xbot_cmd
 
 from .coordinator import Driver, DriverError, Reading
-from .layout import parse_pmc_config
+from .layout import parse_pmc_config, wrap_angle
 from .statemachines import ErrorID
 
 log = logging.getLogger(__name__)
@@ -125,7 +125,8 @@ class PmcDriver(Driver):
                 kind = "fault"
             else:
                 kind = "off"
-            out[int(i.xbot_id)] = Reading(float(i.x_pos), float(i.y_pos), float(i.rz_pos), kind, state.name)
+            # The PMC's angle is not wrapped: turned round twice clockwise, it reads -720 deg.
+            out[int(i.xbot_id)] = Reading(float(i.x_pos), float(i.y_pos), wrap_angle(float(i.rz_pos)), kind, state.name)
         return out
 
     def move(self, xid, x, y):
@@ -138,11 +139,15 @@ class PmcDriver(Driver):
                 raise DriverError(str(e)) from e
 
     def rotate(self, xid, rz):
+        """Turn by the difference from where the xbot is, the shortest way. To an absolute angle
+        the PMC turns straight from its own angle, unwrapped: from -90 deg to 180 deg it turns
+        +270 deg, the long way."""
         with self._lock:
             try:
+                now = next(float(i.rz_pos) for i in self._all() if int(i.xbot_id) == int(xid))
                 return float(xbot_cmd.rotary_motion_p2p(
-                    self._next_label(), int(xid), pm.ROTATIONMODE.NO_ANGLE_WRAP, float(rz),
-                    float(self.turn_speed), float(self.turn_accel), pm.POSITIONMODE.ABSOLUTE))
+                    self._next_label(), int(xid), pm.ROTATIONMODE.NO_ANGLE_WRAP, wrap_angle(float(rz) - now),
+                    float(self.turn_speed), float(self.turn_accel), pm.POSITIONMODE.RELATIVE))
             except Exception as e:
                 raise DriverError(str(e)) from e
 

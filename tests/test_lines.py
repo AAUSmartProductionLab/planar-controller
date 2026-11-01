@@ -233,6 +233,32 @@ def test_xbots_wait_for_the_turn_spot_nearest_to_them_rather_than_drive_on_to_an
     assert not h.sim.collisions
 
 
+# Clockwise round the ring one slot in from the edge, a turn spot on every edge flyway's centre,
+# a station on each side, beside the ring (the xbot faces the module there: outwards).
+CLOCKWISE = {
+    "lanes": [{"name": "clockwise", "points": [[180, 180], [180, 540], [780, 540], [780, 180], [180, 180]], "oneWay": True}],
+    "turnSpots": [[120, 120], [360, 120], [600, 120], [840, 120], [120, 360], [840, 360],
+                  [120, 600], [360, 600], [600, 600], [840, 600]],
+    "idleArea": [[60, 540], [60, 300]],
+}
+
+
+def test_round_the_sides_facing_outwards_every_turn_is_a_quarter_turn_on_a_turn_spot():
+    h = Harness({1: (0, 4)}, layout=CLOCKWISE)
+    turns = _spy_turns(h)
+    sides = [((2, 5), 90), ((7, 2), 0), ((4, 0), -90), ((0, 1), 180)]  # north, east, south, west
+    for cell, rz in sides * 2:
+        assert h.go(1, cell, rz_deg=rz)
+        assert math.degrees(h.sim.xbots[1].rz) == pytest.approx(rz % 360 if rz == 180 else rz, abs=1e-6)
+    assert [round(math.degrees(t)) for _, t in h.sim.turns] == [90] + [-90] * 7  # never three quarters round
+    spots = {(round(x * 1000), round(y * 1000)) for x, y in h.lines.turn_spots}
+    assert {at for _, at in turns} <= spots
+    forward = {(a, b) for _, cells in h.lines.lanes for a, b in zip(cells, cells[1:])}
+    path = h.visited[1]
+    assert all((a, b) in forward for a, b in zip(path, path[1:]) if a in h.lines.lane_cells and b in h.lines.lane_cells)
+    assert not h.sim.collisions
+
+
 def test_free_xbots_queue_in_the_idle_area_and_are_pushed_only_along_the_lanes():
     h = Harness({1: (2, 1), 2: (5, 4), 3: (6, 2)})
     h.run(30)

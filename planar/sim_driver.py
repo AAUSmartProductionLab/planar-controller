@@ -58,6 +58,7 @@ class SimDriver(Driver):
         self.now = 0.0
         self.collisions = []
         self.commands = []
+        self.turns = []  # (xid, how far it turned, rad, + counterclockwise)
         self.auto = None  # auto routing in progress: (xids, stages, poses, t0)
 
     # --- Driver --------------------------------------------------------------------------
@@ -91,9 +92,11 @@ class SimDriver(Driver):
         xb = self._ready(xid)
         if self.layout.spot_at(xb.x, xb.y) is None:
             raise DriverError(f"xbot {xid}: WRONGXBOTPOSITION")
-        distance = abs(rz - xb.rz)
+        turn = wrap_angle(rz - xb.rz)  # the shortest way, as PmcDriver turns
+        distance = abs(turn)
         total = _travel_time(distance, self.turn_speed, self.turn_accel)
-        xb.motion = ("rotate", xb.rz, wrap_angle(rz), self.now, total, distance)
+        xb.motion = ("rotate", xb.rz, xb.rz + turn, self.now, total, distance)
+        self.turns.append((xid, turn))
         self.commands.append((self.now, xid, "rotate", rz))
         return total
 
@@ -190,6 +193,8 @@ class SimDriver(Driver):
                 f = _fraction(now - t0, total, distance, self.turn_speed, self.turn_accel)
                 xb.rz = start + (target - start) * f
             if f >= 1.0:
+                if kind == "rotate":
+                    xb.rz = wrap_angle(xb.rz)
                 xb.motion = None
         self._check_overlaps()
 

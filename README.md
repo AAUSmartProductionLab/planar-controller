@@ -180,7 +180,9 @@ State 3, ... , `Release(id)`.
 - Plans are executed by dependencies, not by time: an xbot starts into a slot only once the xbot
   that was there has fully left it, so a slow or late xbot cannot cause a collision.
 - The PMC rotates an xbot only on a flyway centre. A turn claims a whole flyway, waits until the
-  others have left it, drives to its centre, turns and drives out. Several claims may wait at
+  others have left it, drives to its centre, turns the shortest way (by the difference from its
+  angle: to an absolute angle the PMC, which does not wrap angles, would turn from -90 to 180 deg
+  three quarters round) and drives out. Several claims may wait at
   once, as long as every xbot that has to clear out of one can still get out of all of them; a
   claim that has waited 5 s gives way to an older one still waiting. An xbot travels only square
   to the axes; another angle is possible only as the final pose on a flyway centre.
