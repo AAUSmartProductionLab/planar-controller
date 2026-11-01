@@ -20,8 +20,16 @@ Each folder is a line-mode layout with stations for the product agents of
 flyways with the hole at (2, 1), 3 xbots): the products must go through, the shuttles never
 collide, step along a lane only its way and turn only on turn spots, by at most half a turn.
 
-Against a running controller, e.g. on Planar Motor's simulator (`tools/pmc-sim.ps1 start`), from
-the repository's root:
+On Planar Motor's simulator, every layout in one go: `python tools/sim_check.py` (with the Python
+the controller runs with; `--start-sim` starts the simulator first, `clockwise-outwards` only that
+one). For each it runs a controller with the layout's settings on a free port, then the scenario
+below, and prints a line, PASS or FAIL:
+
+```
+PASS clockwise-outwards (83 s): 9 products: 8 finished, 1 discarded; ...; 39 lane steps; turns 1x -180 deg, 34x -90 deg; 0 problems
+```
+
+Against a controller you run yourself, from the repository's root:
 
 ```sh
 # the controller, with the layout's settings (PMC_IP=127.0.0.1 for the simulator)

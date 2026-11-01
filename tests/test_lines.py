@@ -288,6 +288,31 @@ def test_a_layout_that_does_not_fit_the_table_fails_the_connect():
     assert not coord.connected
 
 
+def test_a_reset_reads_the_layout_again_and_says_why_it_does_not_take_one():
+    sim = SimDriver(TABLE, {1: (*c(0, 1), 0.0)})
+    read = {"layout": LOOP}
+
+    def source():
+        if isinstance(read["layout"], Exception):
+            raise read["layout"]
+        return parse(json.dumps(read["layout"]))
+    coord = Coordinator(sim, threading.RLock(), line_spec=source(), line_source=source)
+    assert coord.connect() == ErrorID.NONE and coord.line_problem == ""
+    read["layout"] = CLOCKWISE  # changed (in the AAS): taken at the next Reset
+    assert coord.connect() == ErrorID.NONE
+    assert coord.lines.describe() == lines(CLOCKWISE).describe() and coord.line_spec.text == json.dumps(CLOCKWISE)
+    read["layout"] = OSError("connection refused")  # the server is not there: the one before is used
+    assert coord.connect() == ErrorID.NONE
+    assert coord.line_spec.text == json.dumps(CLOCKWISE) and "could not be read again (connection refused)" in coord.line_problem
+    read["layout"] = {**CLOCKWISE, "turnSpots": [[600, 360]]}  # no lane slot under it
+    assert coord.connect() == ErrorID.LINE_LAYOUT_INVALID
+    assert coord.line_problem == "the line layout does not fit the table: turnSpots: (600, 360) mm has no lane slot under it"
+    read["layout"] = {"lanes": 3}
+    assert coord.connect() == ErrorID.LINE_LAYOUT_INVALID and "is no layout: lanes:" in coord.line_problem
+    read["layout"] = LOOP
+    assert coord.connect() == ErrorID.NONE and coord.line_problem == ""
+
+
 def test_the_example_layout_fits_the_4_by_3_table():
     ln = Lines(load(str(Path(__file__).parent.parent / "config" / "line-layout.example.json")), TABLE)
     assert ln.describe() == lines().describe()

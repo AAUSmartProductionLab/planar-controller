@@ -207,9 +207,14 @@ class Agent:
 
 class Coordinator:
     def __init__(self, driver, lock, clock=time.monotonic, *, plan_timeout=0.5, plan_budget=0.05,
-                 patience_s=None, displace_held=False, loading_station=None, idle_rz=None, line_spec=None):
+                 patience_s=None, displace_held=False, loading_station=None, idle_rz=None, line_spec=None,
+                 line_source=None):
         self.driver = driver
         self.line_spec = line_spec  # line mode: the lanes they travel on (see lines.py); None: free
+        # line mode: () -> LineSpec, to read the layout again at every connect (a Reset); OSError
+        # when it cannot be read (the one read before is used then), LineError when it is no layout.
+        self.line_source = line_source
+        self.line_problem = ""     # why the last connect did not take the line layout as it is now
         self.lines = None          # the line spec on the table, once connected
         self.graph = None          # the steps the planner may take: {slot: [slots]}
         self.graph_reverse = None
@@ -296,22 +301,39 @@ class Coordinator:
 
     # --- connection --------------------------------------------------------------------------
 
+    def _layout_invalid(self, problem):
+        log.error("%s", problem)
+        self.line_problem = problem
+        return ErrorID.LINE_LAYOUT_INVALID
+
     def connect(self, xids=None):
-        """Connect to the PMC (blocking; from a job or before start()). Returns an ErrorID."""
+        """Connect to the PMC (blocking; from a job or before start()); in line mode with a
+        line_source, read the layout again. Returns an ErrorID."""
         try:
             layout = self.driver.connect()
             readings = self.driver.read()
         except DriverError as e:
             log.error("connecting to the PMC: %s", e)
             return e.code
-        lines = None
-        if self.line_spec is not None:
+        spec, problem = self.line_spec, ""
+        if self.line_source is not None:
             try:
-                lines = Lines(self.line_spec, layout)
+                spec = self.line_source()
             except LineError as e:
-                log.error("the line layout does not fit the table: %s", e)
-                return ErrorID.LINE_LAYOUT_INVALID
+                return self._layout_invalid(f"the line layout is no layout: {e}")
+            except OSError as e:
+                problem = f"the line layout could not be read again ({e}); the one read before is used"
+                log.warning("%s", problem)
+        lines = None
+        if spec is not None:
+            try:
+                lines = Lines(spec, layout)
+            except LineError as e:
+                return self._layout_invalid(f"the line layout does not fit the table: {e}")
         with self.lock:
+            if spec is not None and self.line_spec is not None and spec.text != self.line_spec.text:
+                log.info("line mode: the line layout has changed since it was read before")
+            self.line_spec, self.line_problem = spec, problem
             self.layout = layout
             self.lines = lines
             self.graph = lines.graph if lines else layout.adjacency
@@ -849,6 +871,8 @@ class Coordinator:
         """Turn on the spot it stands on, once its neighbours are clear of the turn."""
         boxes = (self.layout.spot_box(spot),)
         if self._claim(agent, boxes) and self._zone_clear(agent):
+            log.info("xbot %d: turns to %.0f deg where it is, on (%.0f, %.0f) mm", agent.xid, math.degrees(rz),
+                     spot[0] * 1000, spot[1] * 1000)
             self._run_ops(agent, [("rotate", rz)], boxes)
 
     def _leave_dock(self, agent, toward=None, target=None):

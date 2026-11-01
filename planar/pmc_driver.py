@@ -15,6 +15,15 @@ from pmclib import pmc_types as pm
 from pmclib import system_commands as sys_cmd
 from pmclib import xbot_commands as xbot_cmd
 
+if not hasattr(pm, "XBOTSTATE"):  # older pmclibs name their enums otherwise (XbotState)
+    try:
+        from importlib.metadata import version
+        _have = f"pmclib {version('pmclib')}"
+    except Exception:
+        _have = "this pmclib"
+    raise ImportError(f"{_have} is not the one the controller is written for: "
+                      "pip install dependencies/pmclib-117.9.1-py3-none-any.whl")
+
 from .coordinator import Driver, DriverError, Reading
 from .layout import parse_pmc_config, wrap_angle
 from .statemachines import ErrorID

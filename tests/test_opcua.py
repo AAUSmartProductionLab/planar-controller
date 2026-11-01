@@ -61,11 +61,14 @@ async def _move_over_opc_ua():
             skill = await path("PlanarShuttle1", "Skills", "MoveToPosition")
             mm = lambda v: ua.Variant(float(v), ua.VariantType.Double)
 
+            xbot = ("PlanarShuttle1", "Equipment", "Xbot")
+            assert all(math.isnan(v) for v in [await read(*xbot, k) for k in ("X", "Y", "Rz")]), "not read until the Reset"
             assert await call(table, "Reset", session) == (True, ErrorID.NONE)
             assert await wait(await path("PlanarTable", "Module", "State"), int(ModuleState.IDLE))
+            assert [await read(*xbot, k) for k in ("X", "Y", "Rz")] == [60.0, 60.0, 0.0]
             pmc = ("PlanarTable", "Equipment", "PMC")
             assert [await read(*pmc, n) for n in ("Columns", "Rows", "FlywaySize", "Holes")] == [4, 3, 240.0, "2,1"]
-            assert [await read("PlanarTable", "Equipment", n) for n in ("Mode", "LineLayout")] == ["free", ""]
+            assert [await read("PlanarTable", "Equipment", n) for n in ("Mode", "LineLayout", "LineLayoutProblem")]                 == ["free", "", ""]
             assert await call(table, "Start", session) == (True, ErrorID.NONE)
             assert await wait(await path("PlanarShuttle1", "Module", "State"), int(ModuleState.EXECUTE))
 

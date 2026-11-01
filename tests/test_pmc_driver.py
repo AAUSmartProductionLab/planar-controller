@@ -22,12 +22,11 @@ class _Names:
         return _Member(name)
 
 
-@pytest.fixture
-def pmc(monkeypatch):
-    """The PMC as PmcDriver sees it: one xbot at state["rz"]; its commands in state["sent"]."""
-    state = {"rz": 0.0, "sent": []}
+def _load(monkeypatch, state, enums=("XBOTSTATE", "PMCSTATUS", "ROTATIONMODE", "POSITIONMODE", "LINEARPATHTYPE",
+                                      "LEVITATEOPTIONS")):
+    """planar/pmc_driver.py on a stand-in pmclib with these enums."""
     pm = types.ModuleType("pmclib.pmc_types")
-    for enum in ("XBOTSTATE", "PMCSTATUS", "ROTATIONMODE", "POSITIONMODE", "LINEARPATHTYPE", "LEVITATEOPTIONS"):
+    for enum in enums:
         setattr(pm, enum, _Names())
     pm.ALLXBOTSFEEDBACKOPTION = lambda value: value
     xbot = types.ModuleType("pmclib.xbot_commands")
@@ -44,7 +43,19 @@ def pmc(monkeypatch):
     spec = importlib.util.spec_from_file_location("planar._pmc_driver_under_test", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.PmcDriver(), state
+    return module
+
+
+@pytest.fixture
+def pmc(monkeypatch):
+    """The PMC as PmcDriver sees it: one xbot at state["rz"]; its commands in state["sent"]."""
+    state = {"rz": 0.0, "sent": []}
+    return _load(monkeypatch, state).PmcDriver(), state
+
+
+def test_a_pmclib_the_driver_is_not_written_for_says_which_to_install(monkeypatch):
+    with pytest.raises(ImportError, match="pip install dependencies/pmclib-117.9.1"):
+        _load(monkeypatch, {}, enums=("XbotState", "PMCSTATUS"))
 
 
 @pytest.mark.parametrize("now, target, turn", [

@@ -92,11 +92,12 @@ Namespace `urn:aau:smartproductionlab:planar`. Modules: `PlanarTable` and `Plana
 | `Module/Reset`, `Start`, `Stop`, `Abort`, `Clear` `(Session)`; `State`, `ErrorID` | |
 | `Skills/MoveToPosition/Start(Session, X, Y, Rz)`, `Stop`, `Abort`, `Reset` `(Session)` | shuttles only; mm and degrees |
 | `Skills/MoveToPosition/State`, `ErrorID`, `Parameters/X,Y,Rz`, `Results/X,Y,Rz` | results: where it ended |
-| `Equipment/Xbot/X`, `Y`, `Rz`, `XbotState` | shuttles: the live pose |
+| `Equipment/Xbot/X`, `Y`, `Rz`, `XbotState` | shuttles: the live pose (mm, degrees in (-180, 180]); NaN until the PMC has been read, at the first Reset |
 | `Equipment/PMC/Connected`, `Columns`, `Rows`, `FlywaySize`, `Holes` | the table: the PMC's connection and the layout it reports (flyways of `FlywaySize` mm in `Columns` by `Rows`, without the `Holes`, given as `"<column>,<row>"` apart by spaces; 0 and empty until connected) |
 | `Equipment/LoadingQueue` | the table: the free shuttles waiting at the loading station (and turned to `IdleRz`), the one on it first, apart by spaces (e.g. `"PlanarShuttle3 PlanarShuttle1"`): the one to occupy for the next product; empty without `LOADING_STATION` |
 | `Equipment/IdleRz` | the table, writable: the orientation in degrees free shuttles are turned to, a multiple of 90; NaN: as they are. Another value is not taken and reads back as it was. Starts as `IDLE_RZ` |
 | `Equipment/Mode`, `Equipment/LineLayout` | the table: `free` or `line`, and in line mode the layout's JSON as it was read (empty in free mode) |
+| `Equipment/LineLayoutProblem` | the table, line mode: why the last Reset did not take the line layout as it is now (it is no layout, does not fit the table, or could not be read again and the one before is used); empty when it did |
 
 Every method answers `[Accepted, ErrorID]` at once. An accepted `MoveToPosition` finishes when
 the xbot has arrived: its `State` turns Succeeded (3), and Failed (4) with an `ErrorID` if it
@@ -144,7 +145,7 @@ its ErrorID in `ErrorID` next to its `State`.
 | 28 | XbotNotDetected | the PMC does not report this xbot (missing or landed) |
 | 29 | XbotCrooked | the xbot is turned off the axes away from a flyway centre and cannot travel |
 | 30 | MotionDeviated | a move ended somewhere else than it was sent |
-| 31 | LineLayoutInvalid | line mode: the table's Resetting found that the line layout does not fit the table (the log says why) |
+| 31 | LineLayoutInvalid | line mode: the table's Resetting found that the line layout, as read again, is no layout or does not fit the table (`Equipment/LineLayoutProblem` says why) |
 
 A typical run: `PlanarTable/Module/Reset`, wait for Idle, `Start`; then per product
 `PlanarShuttle1/Occupation/Occupy(id)`, `Skills/MoveToPosition/Start(id, x, y, rz)`, wait for
@@ -250,8 +251,12 @@ I>>+>>^#     #        a slot of no lane
   put turn spots where a waiting xbot does not stand in the others' way.
 - The table's Reset still sends the shuttles into the queue with the PMC's auto routing, which
   knows nothing of the lanes; the lanes apply from then on.
-- `LINE_LAYOUT` is read once at start-up. From a URL the controller waits for the server while it
-  cannot be reached; a layout that is not valid JSON, or not a layout, stops it with the reason.
+- `LINE_LAYOUT` is read at start-up, and again at every Reset of the table: a layout changed
+  (in the AAS, or the file) is taken by pressing Reset, without restarting the controller. At
+  start-up from a URL the controller waits for the server while it cannot be reached; a layout
+  that is not valid JSON, or not a layout, stops it with the reason. At a Reset such a layout,
+  or one that does not fit the table, fails the Reset with ErrorID 31 and the reason in
+  `Equipment/LineLayoutProblem`; a server that cannot be reached leaves the one read before.
   `config/line-layout.example.json` is the layout above; `config/` is mounted into the container.
 - **Layouts to test with** are in [`config/layouts/`](config/layouts/), each with stations for
   the product agents of `tests/line_scenario.py` and the controller's settings for it
@@ -319,6 +324,10 @@ On a Windows PC with Planar Motor's simulation tool installed, `tools/pmc-sim.ps
 runs its PMC (`Dlls\VirtualPMC.exe`) without the tool's window, for `PMC_IP=127.0.0.1`. The tool is
 not commercially available and not in this repository; the script runs it from where it is
 installed (or `PMC_SIM_DIR`, or a copy in `pmc-sim/`, which git and Docker ignore).
+`python tools/sim_check.py [--start-sim]` then runs every layout of `config/layouts/` against it,
+each with its own controller and the product agents, a PASS or FAIL line per layout. The
+controller's own simulation does not turn xbots as the PMC does (it turned one three quarters
+round, unseen in the simulation), so run it after changing how xbots move.
 
 pmclib is Planar Motor's and not on PyPI; the wheel is in `dependencies/`. 117.9.1 works with PMC
 firmware 117.17.35 and later. 117.15.01 (May 2026) needs firmware 117.26.45 and adds nothing this

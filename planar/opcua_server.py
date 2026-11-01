@@ -164,18 +164,22 @@ class OpcUaServer:
 
         await self._variable(parent, "IdleRz", idle_rz, ua.VariantType.Double, write=set_idle_rz)
 
-        # free or line (MODE), and in line mode the layout's JSON as it was read (LINE_LAYOUT).
-        spec = self.ctl.coordinator.line_spec
-        await self._variable(parent, "Mode", lambda: "line" if spec else "free", ua.VariantType.String)
-        await self._variable(parent, "LineLayout", lambda: spec.text if spec else "", ua.VariantType.String)
+        # free or line (MODE); in line mode the layout's JSON as it was read (LINE_LAYOUT, read
+        # again at every Reset), and why the last Reset did not take it as it is now (empty: it did).
+        coordinator = self.ctl.coordinator
+        await self._variable(parent, "Mode", lambda: "line" if coordinator.line_spec else "free",
+                             ua.VariantType.String)
+        await self._variable(parent, "LineLayout", lambda: coordinator.line_spec.text if coordinator.line_spec else "",
+                             ua.VariantType.String)
+        await self._variable(parent, "LineLayoutProblem", lambda: coordinator.line_problem, ua.VariantType.String)
 
     async def _shuttle_equipment(self, parent, xid):
         xbot = await parent.add_object(self.idx, "Xbot")
 
         def reading(i):
             snap = self.ctl.coordinator.snapshot(xid)
-            if snap is None:
-                return 0.0 if i < 3 else "UNKNOWN"
+            if snap is None:  # the PMC not read yet (it is at the first Reset)
+                return math.nan if i < 3 else "UNKNOWN"
             pose, state, detail = snap
             return [pose.x * 1000.0, pose.y * 1000.0, math.degrees(pose.rz), detail or state][i]
 

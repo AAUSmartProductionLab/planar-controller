@@ -17,14 +17,15 @@ Environment (each also an option, see --help):
   MODE            free (the default): the xbots may travel anywhere on the table; line: only
                   on the lanes of LINE_LAYOUT (see planar/lines.py)
   LINE_LAYOUT     line mode: the layout's JSON file, or an http(s) URL to fetch it from (e.g.
-                  the $value of the line AAS's Parameters/PlanarRouting); its idleArea is the
-                  loading queue
+                  the $value of the line AAS's Parameters/PlanarRouting), read again at every
+                  Reset of the table; its idleArea is the loading queue
   XBOT_SPEED      m/s (0.5), XBOT_ACCEL m/s^2 (2.0)
   LOG_LEVEL       INFO
 """
 
 import argparse
 import asyncio
+import errno
 import logging
 import math
 import os
@@ -159,7 +160,8 @@ async def main():
         shuttles = await detect(driver)
     ctl = PlanarController(driver, shuttles, displace_held=args.displace_held,
                            patience_s=args.blocked_timeout or None, loading_station=args.loading_station,
-                           idle_rz=args.idle_rz, line_spec=line_spec)
+                           idle_rz=args.idle_rz, line_spec=line_spec,
+                           line_source=(lambda: lines.load(args.line_layout)) if line_spec else None)
     server = OpcUaServer(ctl, args.endpoint)
     await server.init()
     ctl.start()
@@ -168,6 +170,13 @@ async def main():
         if args.autostart:
             tasks.append(asyncio.create_task(autostart(ctl)))
         await asyncio.gather(*tasks)
+    except OSError as e:
+        # Windows: WSAEADDRINUSE, or EACCES binding 0.0.0.0 on a port another program holds
+        if e.errno not in (errno.EADDRINUSE, errno.EACCES, 10048, 10013):
+            raise
+        raise SystemExit(f"OPC UA endpoint {args.endpoint}: its port is in use by another program (another "
+                         f"controller still running? on Windows the OPC UA Local Discovery Server holds 4840); "
+                         f"set OPCUA_ENDPOINT to another port, e.g. opc.tcp://0.0.0.0:4841/") from None
     finally:
         ctl.shutdown()
 
