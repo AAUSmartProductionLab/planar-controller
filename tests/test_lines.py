@@ -337,6 +337,7 @@ def test_a_layout_is_fetched_from_a_url_as_from_an_aas_server():
         spec = load(f"http://127.0.0.1:{server.server_port}/submodels/x/submodel-elements/PlanarRouting/$value")
     finally:
         server.shutdown()
+        server.server_close()  # else the next request waits out its 10 s timeout, unanswered
     assert Lines(spec, TABLE).idle == lines().idle
     with pytest.raises(OSError):
         load(f"http://127.0.0.1:{server.server_port}/gone")
@@ -377,7 +378,8 @@ def _traffic(n, seed, moves=6, limit_s=400):
     return h.t, not pending and not any(left.values()), len(h.sim.collisions), h.covered - allowed
 
 
-@pytest.mark.parametrize("n, seed", [(4, 1), (8, 1), (8, 2)])
+@pytest.mark.parametrize("n, seed", [(4, 1), pytest.param(8, 1, marks=pytest.mark.slow),
+                                     pytest.param(8, 2, marks=pytest.mark.slow)])
 def test_traffic_on_the_loop_finishes_without_deadlock(n, seed):
     # These once deadlocked at the turn spot: an xbot pushed into a dead end of the one-way loop,
     # a claimer pushed off its turn spot round the loop, a claim trapping one behind it.

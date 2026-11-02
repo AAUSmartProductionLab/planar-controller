@@ -107,6 +107,10 @@ class Occupation:
     def holds(self, session):
         return bool(session) and session == self._holder
 
+    def allows(self, session):
+        """Whether the session may command what is occupied: its occupant, or anyone while it is not occupied."""
+        return self._holder is None or self.holds(session)
+
     def occupy(self, session) -> Answer:
         with self._lock:
             if not session:
@@ -354,7 +358,7 @@ class Module:
 
     def command(self, name, session) -> Answer:
         with self._lock:
-            if name != "Abort" and self.occupation.occupied and not self.occupation.holds(session):
+            if name != "Abort" and not self.occupation.allows(session):
                 return refuse(ErrorID.NOT_PERMITTED)
             return {
                 "Reset": self.reset,

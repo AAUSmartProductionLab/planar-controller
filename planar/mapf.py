@@ -335,8 +335,10 @@ def execution_time(configs, motion=Motion()):
     executing the plan as the coordinator does: an xbot starts a move once the move it depends on
     has been made, and goes on in one straight motion through the slots ahead of it whose
     dependencies are met by then, so every corner and every wait costs a stop and a start.
+    motion: how the xbots move, one Motion for all or a list of one per xbot.
     """
     per_xbot = actions(configs)
+    motions = motion if isinstance(motion, list) else [motion] * len(per_xbot)
     done = {}  # action id -> when it was made (the xbot reached the next slot centre)
     free = [0.0] * len(per_xbot)
     nxt = [0] * len(per_xbot)
@@ -358,10 +360,11 @@ def execution_time(configs, motion=Motion()):
                 if a[3] is not None and done.get(a[3], math.inf) > start:
                     break
                 run.append(a)
-            distance = len(run) * motion.pitch
+            m = motions[i]
+            distance = len(run) * m.pitch
             for k, a in enumerate(run):
-                done[a[0]] = start + motion.time_at((k + 1) * motion.pitch, distance)
-            free[i] = start + motion.travel_time(distance)
+                done[a[0]] = start + m.time_at((k + 1) * m.pitch, distance)
+            free[i] = start + m.travel_time(distance)
             nxt[i] += len(run)
             progress = True
     if any(nxt[i] < len(acts) for i, acts in enumerate(per_xbot)):
@@ -373,7 +376,7 @@ def plan(instance, timeout=0.5, budget=0.05, seed=0, motion=Motion(), max_seeds=
     """
     LaCAM from one seed after the other: the first complete plan is taken, and while budget
     seconds have not passed, more seeds are tried (up to max_seeds). Of the complete plans, the
-    one estimated to be done soonest wins (execution_time). Never longer than timeout.
+    one estimated to be done soonest wins (execution_time, with motion). Never longer than timeout.
     """
     t0 = time.monotonic()
     best, best_key = None, None

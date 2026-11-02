@@ -6,13 +6,15 @@ The planar table as modules, built like the generated IEC 61499 modules:
   routing; Hold pauses every xbot where it is, Unhold carries on; Abort stops every xbot at
   once. Its Stop and Abort reach every shuttle, its Reset, Start, Hold, Unhold and Clear the
   shuttles in the matching state, so one Reset and one Start of the table bring everything up.
-  Another program taking mastership of the PMC aborts it with MastershipLost (32).
+  Another program taking mastership of the PMC aborts it with MastershipLost (32). SetSpeed sets
+  how fast every xbot moves.
 - PlanarShuttle<N>: one per xbot. An orchestrator occupies a shuttle, runs its MoveToPosition
   skill (X, Y in mm, Rz in degrees) as often as it likes, and releases it. Start answers at once;
   the skill's State turns Succeeded when the xbot has arrived (Failed with an ErrorID if it
   cannot). Hold pauses the xbot (the skill stays Running), Unhold carries on. Resetting recovers
   the xbot if the PMC switched it off after an accident, and checks that it is there and fit to
-  move; Abort stops it at once. Its occupant may tell the PMC its payload (SetPayload).
+  move; Abort stops it at once. Its occupant may tell the PMC its payload (SetPayload), and
+  whoever may command it may keep the xbot slower than the table (SetSpeed).
 
 Whether the planner may push an xbot out of another's way follows from its shuttle: an occupied
 shuttle that is not moving stays where it is (a station may be working on it), and so does one
@@ -97,7 +99,7 @@ class PlanarController:
             self.shuttles[xid] = shuttle
 
         self.coordinator.on_tick.append(self.table.poll)
-        self.coordinator.held_by = self._held
+        self.coordinator.pinned_by = self._pinned
         self.coordinator.on_connection_lost = self.table.fail
 
     @property
@@ -163,11 +165,22 @@ class PlanarController:
             error = self.coordinator.set_payload(xid, float(kg), cg_height_mm / 1000.0)
         return OK if error == ErrorID.NONE else refuse(error)
 
+    def set_speed(self, xid, session, speed, accel):
+        """How fast xbot xid may move at most (m/s, m/s^2; 0 or NaN: as fast as the table's), or
+        every xbot (xid None: the table's; 0 or NaN: as it started): whoever may command its
+        module (the occupant, or anyone while it is not occupied)."""
+        module = self.table if xid is None else self.shuttles[xid]
+        with self.lock:
+            if not module.occupation.allows(session):
+                return refuse(ErrorID.NOT_PERMITTED)
+            error = self.coordinator.set_speed(xid, speed, accel)
+        return OK if error == ErrorID.NONE else refuse(error)
+
     def zone_command(self, name, operation, session):
         """Deactivate or Activate a zone: whoever may command the table (its occupant, or anyone
         while it is not occupied)."""
         with self.lock:
-            if self.table.occupation.occupied and not self.table.occupation.holds(session):
+            if not self.table.occupation.allows(session):
                 return refuse(ErrorID.NOT_PERMITTED)
             if operation == "Deactivate":
                 error = self.coordinator.deactivate_zone(name)
@@ -177,12 +190,12 @@ class PlanarController:
 
     # --- asked by the coordinator, with the lock held ------------------------------------
 
-    def _held(self, xid):
+    def _pinned(self, xid):
         """Whether the planner must leave this xbot where it is. Asked at the moment it plans, so a
-        shuttle whose move has just ended is held before anything can push it."""
+        shuttle whose move has just ended is pinned before anything can push it."""
         shuttle = self.shuttles.get(xid)
         if shuttle is None:
             return True  # not offered as a shuttle: nobody here may move it
         moving = any(s.active for s in shuttle.skills.values())
-        usable = shuttle.state in (ModuleState.IDLE, ModuleState.EXECUTE)  # (held: it stays put too)
+        usable = shuttle.state in (ModuleState.IDLE, ModuleState.EXECUTE)  # (Held: it stays put too)
         return not usable or (shuttle.occupation.occupied and not moving and not self.displace_held)

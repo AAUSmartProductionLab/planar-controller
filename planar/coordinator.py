@@ -14,12 +14,13 @@ Each xbot is in one of these situations:
 
 The planner (LaCAM with PIBT, see mapf.py) moves the xbots that may move: those with a task,
 and idle ones that nobody holds, which it may push out of the way and brings back to where they
-were. An xbot that is held (its shuttle is occupied and not moving) stays where it is: a station
-may be working on it.
+were. An xbot that is pinned (its shuttle is occupied and not moving) stays where it is: a
+station may be working on it.
 
 Plans are executed by dependencies, not by time: an xbot starts into a slot only once every
-xbot planned to be there before it has fully left. Consecutive steps in one direction whose
-dependencies are met are sent as one motion. A new plan is made at once whenever the set of
+xbot planned to be there before it has fully left, and not into the trail of another xbot's
+move in flight (Layout.trail): the PMC would stop it there. Consecutive steps in one direction
+whose dependencies are met are sent as one motion. A new plan is made at once whenever the set of
 xbots, their goals or the walls change: an xbot on its way is planned from the slot its motion
 ends on, and nobody enters a slot it has still to leave before it has left it, so the others
 need not stop for the new plan.
@@ -36,9 +37,15 @@ area, the loading queue, for the ones nobody holds); turns are made on the turn 
 the one nearest to it, waiting behind it while another turns there, and there is no straight move
 off the lanes.
 
-A Hold pauses xbots where they are (pause, resume): nothing more is sent to a paused xbot, and
-neither its motion nor its task times out meanwhile. A zone (zones.py) switched off or fenced is
-a wall for every xbot: none is planned into it or turns in it, and a target in it is refused.
+A Hold pauses xbots where they are (pause, resume): the PMC pauses the motions in flight, nothing
+more is sent to a paused xbot, and neither its motion nor its task times out meanwhile. A zone
+(zones.py) switched off or fenced is a wall for every xbot: none is planned into it or turns in
+it, and a target in it is refused.
+
+Every xbot moves at the table's speed and acceleration, or slower as its own limits (set_speed)
+and its payload have it (speed_of); the planner estimates each one's moves with its own. In a
+zone the PMC slows it by the zone's speed, which it leaves out of the time it says a motion
+takes: a motion through a zone is given that much longer before it times out (_zone_speed).
 
 Units: metres and radians.
 """
@@ -51,8 +58,9 @@ from collections import deque
 from dataclasses import dataclass, field
 
 from . import mapf
+from .driver import DriverError
 from .layout import (ANGLE_TOLERANCE_RAD, EXACT_M, POSITION_TOLERANCE_M, angle_difference, hull,
-                     is_square_aligned, overlap, wrap_angle)
+                     is_square_aligned, overlap, steps_from, wrap_angle)
 from .lines import LineError, Lines
 from .statemachines import ErrorID
 
@@ -63,7 +71,7 @@ PROGRESS_TOLERANCE_M = 0.0005
 # sweeps no more slots than this; anything longer goes through the planner.
 DIRECT_MAX_SLOTS = 16
 MOTION_START_GRACE_S = 0.5
-# A claim that has waited this long for its zone to clear gives way to an older one still waiting
+# A claim that has waited this long for its slots to clear gives way to an older one still waiting
 # (and claims again after as long), so claims that need each other's room cannot wait for ever.
 CLAIM_YIELD_S = 5.0
 # The PMC's auto routing takes at most this many xbots in one command.
@@ -71,6 +79,9 @@ AUTO_DRIVE_MAX = 10
 GATHER_TIMEOUT_S = 120.0
 ZONE_READ_S = 0.5      # how often the zones' states are read from the PMC
 FLYWAY_READ_S = 5.0    # how often the flyways' power and temperatures are
+# A move into the trail of another's move in flight (Layout.trail) waits while that one still has
+# longer than this to go: Planar Motor's simulator stops it with an obstacle at about 0.65 s.
+TRAIL_WAIT_S = 0.4
 
 
 @dataclass
@@ -78,95 +89,6 @@ class Pose:
     x: float
     y: float
     rz: float = 0.0
-
-
-@dataclass
-class Reading:
-    """One xbot as the driver reads it. state: idle, moving, fault or off."""
-    x: float
-    y: float
-    rz: float
-    state: str
-    detail: str = ""
-
-
-class DriverError(Exception):
-    def __init__(self, message, code=ErrorID.PMC_ERROR):
-        super().__init__(message)
-        self.code = ErrorID(code)
-
-
-class Driver:
-    """What the coordinator needs from the PMC. Called from the coordinator's thread, but for
-    stop(), pause() and resume(), which a module's command may call from anywhere, and the
-    payload and the zones, which OPC UA's methods set (a driver serialises its calls).
-
-    The ones after auto_drive() are what a PMC offers besides moving: a driver without them
-    does without (the defaults)."""
-
-    def connect(self):
-        """Connect, take mastership (a DriverError MASTERSHIP_LOST if another program keeps it),
-        recover the xbots the PMC switched off after an accident, levitate; return the Layout."""
-        raise NotImplementedError
-
-    def read(self) -> dict:
-        """{xid: Reading}; a DriverError MASTERSHIP_LOST once another program has taken mastership."""
-        raise NotImplementedError
-
-    def move(self, xid, x, y) -> float:
-        raise NotImplementedError
-
-    def rotate(self, xid, rz) -> float:
-        """Turn to rz the shortest way (by at most half a turn)."""
-        raise NotImplementedError
-
-    def stop(self, xid=0):
-        raise NotImplementedError
-
-    def auto_drive(self, xids, targets):
-        """Route these xbots with the PMC's own auto routing, each to one of the targets ((x, y),
-        any to any); the xbots read as moving until they are there."""
-        raise NotImplementedError
-
-    def close(self):
-        """Disconnect from the PMC (the controller is stopping)."""
-
-    def pause(self, xid=0):
-        """Pause the xbot's motion where it is (0: every xbot's); it reads as idle meanwhile,
-        and motions sent meanwhile wait too."""
-        raise DriverError("this PMC cannot pause a motion")
-
-    def resume(self, xid=0):
-        """Carry on with the motions paused (0: every xbot's)."""
-        raise DriverError("this PMC cannot pause a motion")
-
-    def payload(self, xid):
-        """(kg, centre of gravity height m, max acceleration m/s^2) as the PMC has them; None: unknown."""
-        return None
-
-    def set_payload(self, xid, kg, cg_height):
-        """Tell the PMC the xbot's payload; returns the max acceleration with it (m/s^2, None:
-        unknown), which the xbot's moves keep to. DriverError OUT_OF_RANGE if it is too much."""
-        raise DriverError("this PMC does not take payloads")
-
-    def recover(self, xids):
-        """Recover these xbots if the PMC switched them off after an accident; the ones it did."""
-        return []
-
-    def define_zone(self, zid, box, speed):
-        raise DriverError("this PMC has no zones", ErrorID.ZONES_INVALID)
-
-    def zone_status(self, zid):
-        """(state, xids inside): the PMC's ZONESTATE name, e.g. ACTIVATED_UNFENCED, LOADING_FENCED."""
-        raise DriverError("this PMC has no zones")
-
-    def zone_control(self, zid, operation):
-        """deactivate (fence it, the xbots inside off), activate (levitate them) or unfence."""
-        raise DriverError("this PMC has no zones")
-
-    def flyways(self):
-        """{(column, row): (power W, CPU, amplifier, motor temperature deg C)}."""
-        return {}
 
 
 @dataclass
@@ -183,10 +105,11 @@ class Motion:
     kind: str                      # nav, move or rotate
     target: tuple                  # (x, y) or (rz,)
     sent: float
-    expected: float
+    expected: float                # s it should take: as the PMC says, longer in a slow zone
     actions: list = field(default_factory=list)
     origin: tuple = None
     direction: tuple = None
+    trail: tuple = None            # a move's: the box no other xbot is sent into meanwhile (Layout.trail)
 
 
 @dataclass
@@ -235,23 +158,25 @@ class Agent:
         self.cell = None
         self.footprint = frozenset()
         self.home = None
-        self.held = False
+        self.pinned = False        # the planner may not push it (pin(); or as pinned_by() says)
         self.fault = None
         self.task = None
         self.motion = None
         self.actions = deque()
         self.goal = None           # what the current plan takes it to
         self.want = None           # what it should be planned to now
-        self.zone = None           # slots a macro sweeps: others are planned off them
-        self.zone_boxes = ()       # the boxes it sweeps: nothing else may be in them
-        self.zone_since = 0.0      # when it claimed them
+        self.claim = None          # slots a macro sweeps: others are planned off them
+        self.claim_boxes = ()      # the boxes it sweeps: nothing else may be in them
+        self.claim_since = 0.0     # when it claimed them
         self.desired = None        # where the last plan wanted it (its goal may stand in for it)
         self.turn_after = 0.0      # a turn to the idle orientation failed: not again before this
         self.ops = deque()
         self.ops_done = None
-        self.paused_at = None      # when its motion was paused (a Hold); None: not paused
+        self.paused_at = None      # when it was paused (a Hold); None: not paused
+        self.motion_paused = False  # the PMC has paused its motion in flight
         self.payload = None        # (kg, centre of gravity height m) as last set or read; None: unknown
         self.max_accel = None      # m/s^2 the PMC allows with it; None: unknown
+        self.speed_limit = (None, None)  # (m/s, m/s^2) it keeps to below the table's (set_speed); None: none
 
     @property
     def present(self):
@@ -276,10 +201,14 @@ class Agent:
 
 
 class Coordinator:
-    def __init__(self, driver, lock, clock=time.monotonic, *, plan_timeout=0.5, plan_budget=0.05,
-                 patience_s=None, displace_held=False, loading_station=None, idle_rz=None, line_spec=None,
+    def __init__(self, driver, lock, clock=time.monotonic, *, speed=0.5, accel=2.0, plan_timeout=0.5,
+                 plan_budget=0.05, patience_s=None, loading_station=None, idle_rz=None, line_spec=None,
                  line_source=None, zones=()):
         self.driver = driver
+        if not (0 < speed < math.inf and 0 < accel < math.inf):
+            raise ValueError(f"the speed and acceleration must be more than 0, not {speed:g} m/s, {accel:g} m/s^2")
+        self.speed, self.accel = speed, accel  # m/s, m/s^2: every xbot's moves at most (set_speed)
+        self._start_speed = (speed, accel)
         self.zone_specs = list(zones)  # zones.ZoneSpec, defined on the PMC at every connect
         self.zones = {}            # name: Zone, once connected
         self.zone_problem = ""     # why the last connect did not define the zones
@@ -299,15 +228,14 @@ class Coordinator:
         self.plan_timeout = plan_timeout
         self.plan_budget = plan_budget  # how long to look for a faster plan once one is found
         self.patience_s = patience_s
-        self.displace_held = displace_held
         self.loading_station = loading_station  # (x, y): idle xbots queue up there
         self.queue = []            # the queue's slots, the one on the station first
         self.idle_rz = None        # idle xbots are turned to this (radians, a multiple of 90 deg)
         if idle_rz is not None and self.set_idle_rz(idle_rz) != ErrorID.NONE:
             raise ValueError(f"the idle orientation must be a multiple of 90 degrees, not {math.degrees(idle_rz):g}")
         self._gathering = None
-        # held_by(xid) -> bool, asked whenever it matters (the modules know); else hold() decides.
-        self.held_by = None
+        # pinned_by(xid) -> bool, asked whenever it matters (the modules know); else pin() decides.
+        self.pinned_by = None
         self.layout = None
         self.agents = {}
         self.connected = False
@@ -525,7 +453,7 @@ class Coordinator:
         if agent.task is not None:  # its turn to the idle orientation: the request goes first
             agent.task = None
             if not agent.in_macro:
-                agent.zone, agent.zone_boxes = None, ()
+                agent.claim, agent.claim_boxes = None, ()
         self._new_task(agent, Pose(target.x, target.y, wrap_angle(target.rz)), finished)
         log.info("xbot %d: to (%.3f, %.3f, %.1f deg)", xid, target.x, target.y, math.degrees(target.rz))
         return ErrorID.NONE
@@ -562,16 +490,14 @@ class Coordinator:
         self._new_task(agent, Pose(*self.layout.center(agent.cell), self.idle_rz), finished, internal=True)
 
     def halt(self, xid):
-        """Finish where its motion ends, the task failed with Interrupted (a paused motion
-        carries on first)."""
+        """Finish where its motion ends, the task failed with Interrupted (paused: once it
+        carries on)."""
         agent = self.agents.get(xid)
-        if agent and agent.paused_at is not None:
-            self.resume(xid)
         if agent and agent.task:
             agent.task.halting = True
 
     def abort(self, xid):
-        """Stop at once, wherever it is; the task is dropped without a word."""
+        """Stop at once, wherever it is (paused or not); the task is dropped without a word."""
         agent = self.agents.get(xid)
         if agent is None:
             return
@@ -579,9 +505,7 @@ class Coordinator:
             self.driver.stop(xid)
         except DriverError as e:
             log.error("xbot %d: stop: %s", xid, e)
-        if agent.paused_at is not None:
-            self.resume(xid)  # else the motions sent later would wait too
-        agent.task = None
+        agent.task, agent.paused_at = None, None
         self._clear_motion(agent)
 
     def abort_all(self):
@@ -590,61 +514,110 @@ class Coordinator:
             self.driver.stop(0)
         except DriverError as e:
             log.error("stop all: %s", e)
-        if any(a.paused_at is not None for a in self.agents.values()):
-            self.resume()
         for agent in self.agents.values():
-            agent.task = None
+            agent.task, agent.paused_at = None, None
             self._clear_motion(agent)
 
-    def hold(self, xid, held):
+    def pin(self, xid, pinned=True):
+        """Whether the planner must leave the xbot where it is (without pinned_by)."""
         agent = self.agents.get(xid)
         if agent is not None:
-            agent.held = held
+            agent.pinned = pinned
 
     # --- pausing (a module's Hold) -----------------------------------------------------------
 
+    def _agents(self, xid):
+        """Xbot xid's agent, or every agent (None)."""
+        if xid is None:
+            return list(self.agents.values())
+        return [self.agents[xid]] if xid in self.agents else []
+
     def pause(self, xid=None) -> ErrorID:
-        """Pause the xbot's motion where it is (None: every xbot's): nothing it does goes on and
-        nothing new is sent to it, its task does not time out, until resume()."""
+        """Pause the xbot where it is (None: every xbot) until resume(): nothing it does goes on,
+        nothing new is sent to it, and its task does not time out. The PMC pauses the motion in
+        flight, once; an xbot standing still is only sent nothing more."""
         if not self.connected:
             return ErrorID.PMC_NOT_CONNECTED
-        agents = list(self.agents.values()) if xid is None else [self.agents[xid]] if xid in self.agents else []
-        try:
-            self.driver.pause(xid or 0)
-        except DriverError as e:
-            log.error("pausing %s: %s", f"xbot {xid}" if xid else "every xbot", e)
-            return e.code
         now = self.clock()
-        for agent in agents:
-            if agent.paused_at is None:
-                agent.paused_at = now
+        for agent in self._agents(xid):
+            if agent.paused_at is not None:
+                continue  # (its shuttle was held before the table)
+            if agent.motion is not None:
+                try:
+                    self.driver.pause(agent.xid)
+                except DriverError as e:
+                    log.error("xbot %d: pausing its motion: %s", agent.xid, e)
+                    return e.code
+                agent.motion_paused = True
+            agent.paused_at = now
         log.info("%s paused", f"xbot {xid}" if xid else "every xbot")
         return ErrorID.NONE
 
     def resume(self, xid=None) -> ErrorID:
         """Carry on where pause() stopped (None: every xbot); the time paused does not count."""
-        agents = [a for a in (self.agents.values() if xid is None else [self.agents.get(xid)])
-                  if a is not None and a.paused_at is not None]
-        error = ErrorID.NONE
-        if self.connected:
-            try:
-                self.driver.resume(xid or 0)
-            except DriverError as e:
-                log.error("resuming %s: %s", f"xbot {xid}" if xid else "every xbot", e)
-                error = e.code
-        now = self.clock()
-        for agent in agents:
+        error, now = ErrorID.NONE, self.clock()
+        resumed = [a for a in self._agents(xid) if a.paused_at is not None]
+        for agent in resumed:
+            problem = self._resume_motion(agent)
+            if problem != ErrorID.NONE:
+                error = problem
             dt, agent.paused_at = now - agent.paused_at, None
             if agent.motion is not None:
                 agent.motion.sent += dt
             if agent.task is not None:
                 agent.task.progress_at += dt
                 agent.task.claim_after += dt
-            agent.zone_since += dt
+            agent.claim_since += dt
             agent.turn_after += dt
-        if agents:
+        if resumed:
             log.info("%s resumed", f"xbot {xid}" if xid else "every xbot")
         return error
+
+    def _resume_motion(self, agent) -> ErrorID:
+        """The PMC carries on with the motion it paused, if it did."""
+        if not agent.motion_paused:
+            return ErrorID.NONE
+        agent.motion_paused = False
+        if not self.connected:
+            return ErrorID.NONE
+        try:
+            self.driver.resume(agent.xid)
+        except DriverError as e:
+            log.error("xbot %d: resuming its motion: %s", agent.xid, e)
+            return e.code
+        return ErrorID.NONE
+
+    # --- speed -------------------------------------------------------------------------------
+
+    def set_speed(self, xid, speed, accel) -> ErrorID:
+        """How fast xbot xid may move (m/s, m/s^2): it keeps to the less of this and the table's;
+        xid None: the table's, every xbot's. 0 or NaN: none of its own (the table: as it started).
+        From each xbot's next motion on."""
+        values = []
+        for value in (speed, accel):
+            if value is None or math.isnan(value) or value == 0:
+                values.append(None)
+            elif 0 < value < math.inf:
+                values.append(float(value))
+            else:
+                return ErrorID.OUT_OF_RANGE
+        if xid is None:
+            self.speed, self.accel = (v or start for v, start in zip(values, self._start_speed))
+            log.info("speed %g m/s, acceleration %g m/s^2", self.speed, self.accel)
+            return ErrorID.NONE
+        agent = self.agents.get(xid)
+        if agent is None:
+            return ErrorID.XBOT_NOT_DETECTED
+        speed, accel = agent.speed_limit = tuple(values)
+        log.info("xbot %d: speed at most %s, acceleration at most %s", xid,
+                 f"{speed:g} m/s" if speed else "the table's", f"{accel:g} m/s^2" if accel else "the table's")
+        return ErrorID.NONE
+
+    def speed_of(self, agent):
+        """(m/s, m/s^2) its moves are made with: the table's, or less as its own limits and the
+        acceleration the PMC allows with its payload have it."""
+        speed, accel = agent.speed_limit
+        return min(self.speed, speed or math.inf), min(self.accel, accel or math.inf, agent.max_accel or math.inf)
 
     # --- the payload -------------------------------------------------------------------------
 
@@ -690,6 +663,11 @@ class Coordinator:
     def _closed_boxes(self):
         return [z.spec.box for z in self.zones.values() if z.closed]
 
+    def _zone_speed(self, cells):
+        """The least speed of the zones over these slots (1: none). The PMC keeps the xbots in a
+        zone to it, but leaves it out of the seconds it says a motion takes."""
+        return min((z.spec.speed for z in self.zones.values() if z.cells & cells), default=1.0)
+
     def deactivate_zone(self, name) -> ErrorID:
         """Switch the zone off: the PMC fences it and switches off the xbots inside, which may
         then be taken off the table, or new ones put on. Only while it is switched on and no
@@ -710,7 +688,7 @@ class Coordinator:
             planned = any(a.to in zone.cells or a.frm in zone.cells for a in agent.actions)
             flying = agent.flying and any(a.to in zone.cells for a in agent.motion.actions)
             going = agent.task is not None and self._target_cells(agent.task) & zone.cells
-            claim = agent.zone and agent.zone & zone.cells
+            claim = agent.claim and agent.claim & zone.cells
             if on_the_way or planned or flying or going or claim:
                 log.info("zone %s: xbot %d is on its way in, out or across", name, agent.xid)
                 return ErrorID.BUSY
@@ -733,7 +711,7 @@ class Coordinator:
         if zone.state == "ACTIVATED_UNFENCED":
             return ErrorID.NOT_READY
         try:
-            if zone.state in ("ACTIVATED_FENCED",):
+            if zone.state == "ACTIVATED_FENCED":
                 self.driver.zone_control(zone.id, "unfence")
             else:
                 self.driver.zone_control(zone.id, "activate")
@@ -810,14 +788,7 @@ class Coordinator:
         if head is None:
             head = min(sorted(layout.cells), key=lambda c: math.dist(layout.center(c), (sx, sy)))
             log.warning("the loading station (%.3f, %.3f) is not over a slot; the queue starts at %s", sx, sy, head)
-        steps = {head: 0}
-        queue = deque([head])
-        while queue:
-            v = queue.popleft()
-            for u in layout.adjacency[v]:
-                if u not in steps:
-                    steps[u] = steps[v] + 1
-                    queue.append(u)
+        steps = steps_from(layout.adjacency, head)
         inside = lambda c: len(layout.adjacency[c]) == 4
         return sorted(steps, key=lambda c: (steps[c] + 2 * inside(c), len(layout.adjacency[c]),
                                             math.dist(layout.center(c), (sx, sy)), c))
@@ -849,10 +820,12 @@ class Coordinator:
         if len(agents) > AUTO_DRIVE_MAX:
             log.info("%d xbots: more than one auto routing command takes; the planner lines them up", len(agents))
             return
+        speeds = [self.speed_of(a) for a in agents]  # they move as one: the slowest one's
         try:
-            self.driver.auto_drive([a.xid for a in agents], [self.layout.center(c) for c in targets])
-        except (NotImplementedError, DriverError) as e:
-            log.warning("auto routing into the loading queue: %s; the planner lines them up", e or "not supported")
+            self.driver.auto_drive([a.xid for a in agents], [self.layout.center(c) for c in targets],
+                                   min(s for s, _ in speeds), min(a for _, a in speeds))
+        except DriverError as e:
+            log.warning("auto routing into the loading queue: %s; the planner lines them up", e)
             return
         log.info("auto routing xbots %s into the loading queue %s", [a.xid for a in agents], targets)
         self._gathering.routing = True
@@ -988,7 +961,7 @@ class Coordinator:
             if task is None:
                 agent.want = None
                 if (agent.present and not agent.fault and agent.motion is None and not agent.ops
-                        and not self._held(agent)):
+                        and not self._pinned(agent)):
                     if agent.cell is None:
                         # Nobody holds it and it is off the lattice, a wall for everyone: step back on.
                         self._leave_dock(agent)
@@ -1051,13 +1024,17 @@ class Coordinator:
                     task.spot = None  # someone else has it now; look again next time
                 agent.want = agent.cell
                 return
-            if not self._zone_clear(agent):
-                self._wait_for_zone(agent, now)
+            if not self._claim_clear(agent):
+                self._wait_for_claim(agent, now)
                 return
             sx, sy = task.spot
             ops = [("move", sx, sy), ("rotate", target.rz)]
             if not (abs(sx - target.x) < EXACT_M and abs(sy - target.y) < EXACT_M):
-                exit_cell = min(sorted(cells), key=lambda c: self._static_distance(agent, c, self._target_cells(task)))
+                # Toward the target, around the others; with every way blocked for now, toward it
+                # anyway, not back into the xbot behind.
+                targets = self._target_cells(task)
+                exit_cell = min(sorted(cells), key=lambda c: (self._static_distance(agent, c, targets),
+                                                             self._static_distance(agent, c, targets, False)))
                 ops.append(("move", *layout.center(exit_cell)))
             self._run_ops(agent, ops, boxes)
             task.spot = None
@@ -1078,29 +1055,29 @@ class Coordinator:
         if not self._claim(agent, boxes):
             agent.want = agent.cell
             return
-        if not self._zone_clear(agent):
-            self._wait_for_zone(agent, now)
+        if not self._claim_clear(agent):
+            self._wait_for_claim(agent, now)
             return
         self._run_ops(agent, ops, boxes)
 
-    def _wait_for_zone(self, agent, now):
+    def _wait_for_claim(self, agent, now):
         """It waits on its slot for its claim to clear; after CLAIM_YIELD_S it gives way to an
         older claim still waiting too (they may need each other's room to clear)."""
         agent.want = agent.cell
-        if now - agent.zone_since < CLAIM_YIELD_S:
+        if now - agent.claim_since < CLAIM_YIELD_S:
             return
         if self.lines:
             # On lanes the ones in its way may have no way out while it stays put: let go, so the
             # planner may move it too, and claim again later.
             log.info("xbot %d: its claim did not clear in %.0f s; lets go of it for now", agent.xid, CLAIM_YIELD_S)
-            agent.zone, agent.zone_boxes = None, ()
+            agent.claim, agent.claim_boxes = None, ()
             if not self._fixed_spots:
                 agent.task.spot = None
             agent.task.claim_after = now + CLAIM_YIELD_S
-        elif any(o is not agent and o.zone_boxes and not o.in_macro and o.zone_since < agent.zone_since
+        elif any(o is not agent and o.claim_boxes and not o.in_macro and o.claim_since < agent.claim_since
                  for o in self.agents.values()):
             log.info("xbot %d: gives way to an older claim", agent.xid)
-            agent.zone, agent.zone_boxes = None, ()
+            agent.claim, agent.claim_boxes = None, ()
             agent.task.spot = None
             agent.task.claim_after = now + CLAIM_YIELD_S
 
@@ -1181,12 +1158,12 @@ class Coordinator:
 
     def _claims(self, agent):
         """Others' claims, and the zones closed: boxes nothing may sweep."""
-        return [b for o in self.agents.values() if o is not agent for b in o.zone_boxes] + self._closed_boxes()
+        return [b for o in self.agents.values() if o is not agent for b in o.claim_boxes] + self._closed_boxes()
 
     def _turn_here(self, agent, spot, rz):
         """Turn on the spot it stands on, once its neighbours are clear of the turn."""
         boxes = (self.layout.spot_box(spot),)
-        if self._claim(agent, boxes) and self._zone_clear(agent):
+        if self._claim(agent, boxes) and self._claim_clear(agent):
             log.info("xbot %d: turns to %.0f deg where it is, on (%.0f, %.0f) mm", agent.xid, math.degrees(rz),
                      spot[0] * 1000, spot[1] * 1000)
             self._run_ops(agent, [("rotate", rz)], boxes)
@@ -1258,7 +1235,7 @@ class Coordinator:
     def _finish(self, agent, ok, error=ErrorID.NONE):
         task, agent.task = agent.task, None
         if not agent.in_macro:
-            agent.zone, agent.zone_boxes = None, ()  # a claim it was still waiting on
+            agent.claim, agent.claim_boxes = None, ()  # a claim it was still waiting on
         agent.home = agent.cell
         p = agent.pose
         results = {"X": p.x * 1000.0, "Y": p.y * 1000.0, "Rz": math.degrees(p.rz)}
@@ -1279,39 +1256,46 @@ class Coordinator:
             self._finish(agent, False, error)
 
     def _clear_motion(self, agent):
+        self._resume_motion(agent)  # paused on the PMC: else the motions sent to it later would wait too
         agent.motion = None
         agent.ops.clear()
         agent.ops_done = None
         agent.actions.clear()
-        agent.zone, agent.zone_boxes = None, ()
+        agent.claim, agent.claim_boxes = None, ()
         agent.goal = None
         self._signature = None  # others may wait on moves it will not make now: plan again
 
     # --- macros: rotation, docking, undocking ------------------------------------------------
-    # A macro sweeps boxes (zone_boxes). Nothing else may be in them; the planner keeps the
-    # xbots it moves off the slots they overlap (zone). Xbots that stay where they are only have
+    # A macro sweeps boxes (claim_boxes). Nothing else may be in them; the planner keeps the
+    # xbots it moves off the slots they overlap (claim). Xbots that stay where they are only have
     # to be clear of the boxes themselves: two xbots off the lattice may share a slot as long as
     # they do not overlap.
 
     def _run_ops(self, agent, ops, boxes):
-        agent.zone_boxes = tuple(boxes)
-        agent.zone = frozenset().union(*(self.layout.cells_in(b) for b in boxes))
+        agent.claim_boxes = tuple(boxes)
+        agent.claim = frozenset().union(*(self.layout.cells_in(b) for b in boxes))
         agent.ops = deque(ops)
 
         def done():
-            agent.zone, agent.zone_boxes = None, ()
+            agent.claim, agent.claim_boxes = None, ()
             self._classify(agent)
         agent.ops_done = done
 
     def _send_op(self, agent, now):
-        op = agent.ops.popleft()
+        op = agent.ops[0]
+        here = (agent.pose.x, agent.pose.y)
+        if op[0] == "move" and self._in_trail(agent, self.layout.ahead(here, op[1:]), now):
+            return
+        agent.ops.popleft()
+        zone_speed = self._zone_speed(agent.claim or agent.footprint)
         try:
             if op[0] == "move":
-                expected = self.driver.move(agent.xid, op[1], op[2])
-                agent.motion = Motion("move", (op[1], op[2]), now, expected)
+                expected = self.driver.move(agent.xid, op[1], op[2], *self.speed_of(agent))
+                agent.motion = Motion("move", (op[1], op[2]), now, expected / zone_speed,
+                                      trail=self.layout.trail(here, op[1:]))
             else:
                 expected = self.driver.rotate(agent.xid, op[1])
-                agent.motion = Motion("rotate", (op[1],), now, expected)
+                agent.motion = Motion("rotate", (op[1],), now, expected / zone_speed)
         except DriverError as e:
             log.error("xbot %d: %s refused: %s", agent.xid, op, e)
             self._fail(agent, ErrorID.PMC_ERROR)
@@ -1325,18 +1309,18 @@ class Coordinator:
         granted when nothing is in the boxes or on its way into them, so it never waits.
         """
         boxes = tuple(boxes)
-        if agent.zone_boxes == boxes and not immediate:
-            return True  # held already (an immediate claim is always checked afresh)
+        if agent.claim_boxes == boxes and not immediate:
+            return True  # made already (an immediate claim is always checked afresh)
         if any(overlap(z, b) for z in self._closed_boxes() for b in boxes):
             return False
         cells = frozenset().union(*(self.layout.cells_in(b) for b in boxes))
-        waiting = False  # another claim is waiting for its zone to clear
+        waiting = False  # another claim is waiting for its slots to clear
         for other in self.agents.values():
             if other is agent:
                 continue
-            if any(overlap(o, b) for o in other.zone_boxes for b in boxes):
+            if any(overlap(o, b) for o in other.claim_boxes for b in boxes):
                 return False
-            waiting = waiting or bool(other.zone_boxes and not other.in_macro)
+            waiting = waiting or bool(other.claim_boxes and not other.in_macro)
             square = (self.layout.square(other.pose.x, other.pose.y, other.pose.rz)
                       if other.pose is not None else None)
             if square is not None and any(overlap(square, b) for b in boxes):
@@ -1353,40 +1337,40 @@ class Coordinator:
             return False  # it gave way (to the older claim, or in line mode to the ones in its way)
         if not immediate and (waiting or self.lines) and not self._room_to_clear(agent, cells):
             return False
-        agent.zone_boxes = boxes
-        agent.zone = cells
+        agent.claim_boxes = boxes
+        agent.claim = cells
         if not immediate:
-            agent.zone_since = self.clock()
+            agent.claim_since = self.clock()
             log.info("xbot %d: claims %s", agent.xid, sorted(cells))
         return True
 
     def _room_to_clear(self, agent, cells):
         """Whether, with this claim added to the others, every xbot the planner moves that stands
         in a claim not its own can get out of all claims, and there is a slot outside for each."""
-        zones = {o.xid: o.zone for o in self.agents.values() if o.zone and o is not agent}
-        zones[agent.xid] = cells
-        claimed = frozenset().union(*zones.values())
+        claims = {o.xid: o.claim for o in self.agents.values() if o.claim and o is not agent}
+        claims[agent.xid] = cells
+        claimed = frozenset().union(*claims.values())
         open_cells = self.layout.cells - self._walls(exclude=agent)
         outside = open_cells - claimed
         movers = [m for m in self.agents.values() if self._is_mover(m)]
-        if len(outside) < sum(1 for m in movers if m.start not in zones.get(m.xid, ())):
+        if len(outside) < sum(1 for m in movers if m.start not in claims.get(m.xid, ())):
             return False
         if self.lines:  # the claimers stay where they are while they wait (see _plan)
-            open_cells -= {o.start for o in movers if o.xid in zones and o.start is not None}
+            open_cells -= {o.start for o in movers if o.xid in claims and o.start is not None}
         for m in movers:
             start = m.start
-            if start not in claimed or start in zones.get(m.xid, ()):
+            if start not in claimed or start in claims.get(m.xid, ()):
                 continue
             # As the planner sees it: it may cross the claims it stands in, not the others.
-            passable = open_cells - frozenset().union(*[z for z in zones.values() if start not in z])
+            passable = open_cells - frozenset().union(*[z for z in claims.values() if start not in z])
             if self.lines:
                 passable -= self.lines.keep_out([start, m.want], idle=m.task is None)
             if not outside & self._steps_from(start, passable).keys():
                 return False
         return True
 
-    def _zone_clear(self, agent):
-        boxes = agent.zone_boxes
+    def _claim_clear(self, agent):
+        boxes = agent.claim_boxes
         for other in self.agents.values():
             if other is agent:
                 continue
@@ -1394,10 +1378,10 @@ class Coordinator:
                 square = self.layout.square(other.pose.x, other.pose.y, other.pose.rz)
                 if any(overlap(square, b) for b in boxes):
                     return False
-            if other.in_macro and any(overlap(o, b) for o in other.zone_boxes for b in boxes):
+            if other.in_macro and any(overlap(o, b) for o in other.claim_boxes for b in boxes):
                 return False
             if other.motion is not None and other.motion.kind == "nav":
-                if any(a.to in agent.zone or a.frm in agent.zone for a in other.motion.actions):
+                if any(a.to in agent.claim or a.frm in agent.claim for a in other.motion.actions):
                     return False
         return True
 
@@ -1408,16 +1392,14 @@ class Coordinator:
             return False
         if agent.cell in self._closed_cells():
             return False  # fenced in
-        return agent.task is not None or not self._held(agent)
+        return agent.task is not None or not self._pinned(agent)
 
-    def _held(self, agent):
-        if self.displace_held:
-            return False
+    def _pinned(self, agent):
         if self._gathering is not None and agent.xid in self._gathering.xids:
             return False  # being lined up and turned: the planner may move it
-        if self.held_by is not None:
-            return self.held_by(agent.xid)
-        return agent.held
+        if self.pinned_by is not None:
+            return self.pinned_by(agent.xid)
+        return agent.pinned
 
     def _is_wall(self, agent):
         # Landed or lost xbots too: they are still where they were last seen.
@@ -1428,32 +1410,22 @@ class Coordinator:
         for other in self.agents.values():
             if other is not exclude and self._is_wall(other):
                 walls |= other.footprint
-                if other.zone:
-                    walls |= other.zone
-                if other.flying:  # held while on its way: every slot of the way, until it is there
+                if other.claim:
+                    walls |= other.claim
+                if other.flying:  # pinned while on its way: every slot of the way, until it is there
                     walls |= {c for a in other.motion.actions for c in (a.frm, a.to)}
         return walls
 
     def _static_distance(self, agent, cell, toward, around_walls=True):
         """Steps from cell to the nearest of toward, around walls only (in line mode: on the lanes)."""
-        free = self.layout.cells - (self._walls(exclude=agent) if around_walls else self._closed_cells())
         toward = set(toward)
         if cell in toward:
             return 0
+        free = self.layout.cells - (self._walls(exclude=agent) if around_walls else self._closed_cells())
         if self.lines:
             free -= self.lines.keep_out([cell, *toward], idle=agent.task is None)
-        seen = {cell}
-        queue = deque([(cell, 0)])
-        while queue:
-            v, d = queue.popleft()
-            for u in self.graph[v]:
-                if u in seen or u not in free:
-                    continue
-                if u in toward:
-                    return d + 1
-                seen.add(u)
-                queue.append((u, d + 1))
-        return mapf.INF
+        steps = self._steps_from(cell, free)
+        return min((steps[c] for c in toward if c in steps), default=mapf.INF)
 
     def _nearest(self, agent, cells):
         return min(sorted(cells), key=lambda c: self._static_distance(agent, agent.cell, [c]))
@@ -1479,9 +1451,7 @@ class Coordinator:
             fixed, candidates = True, self.lines.turn_spots
         else:
             fixed, candidates = False, [layout.flyway_center(f) for f in layout.flyways]
-        blocked = self._closed_boxes() if fixed else [layout.square(o.pose.x, o.pose.y, o.pose.rz)
-                                                      for o in self.agents.values()
-                                                      if o is not agent and self._is_wall(o)] + self._claims(agent)
+        blocked = self._closed_boxes() if fixed else self._statics(agent) + self._claims(agent)
         best, best_cost = None, (mapf.INF, mapf.INF)
         for spot in candidates:
             if any(overlap(layout.spot_box(spot), b) for b in blocked):
@@ -1513,9 +1483,9 @@ class Coordinator:
 
     def _signature_of(self, movers):
         walls = frozenset(self._walls())
-        zones = frozenset((a.xid, a.zone) for a in self.agents.values() if a.zone)
+        claims = frozenset((a.xid, a.claim) for a in self.agents.values() if a.claim)
         roles = frozenset((a.xid, a.task is not None, a.want) for a in movers)
-        return walls, zones, roles
+        return walls, claims, roles
 
     def _plan(self, movers, now):
         for agent in self.agents.values():
@@ -1539,11 +1509,11 @@ class Coordinator:
         # Its own slot is always one it may start from, even inside another's claim: it may
         # leave a claim but not come back into it (keep_out).
         cells = (self.layout.cells - walls) | set(start.values())
-        zones = {a.xid: a.zone for a in self.agents.values() if a.zone}
+        claims = {a.xid: a.claim for a in self.agents.values() if a.claim}
         # Others' claimed slots: never a goal; not to be entered, except by one already inside,
         # which may cross them on its way out.
-        claimed = {a.xid: frozenset().union(*[z for x, z in zones.items() if x != a.xid]) for a in movers}
-        keep_out = {a.xid: frozenset().union(*[z for x, z in zones.items() if x != a.xid and start[a.xid] not in z])
+        claimed = {a.xid: frozenset().union(*[z for x, z in claims.items() if x != a.xid]) for a in movers}
+        keep_out = {a.xid: frozenset().union(*[z for x, z in claims.items() if x != a.xid and start[a.xid] not in z])
                     for a in movers}
         passable = cells
         if self.lines:
@@ -1552,7 +1522,7 @@ class Coordinator:
             for a in movers:
                 own = [start[a.xid], a.want] if a.task else [start[a.xid], None if self.queue else a.home]
                 keep_out[a.xid] |= self.lines.keep_out(own, idle=a.task is None)
-                if a.zone:
+                if a.claim:
                     # Waiting for its claim to clear, it stays put: pushed off along a one-way
                     # lane it would have to go all the way round, its claim blocking the lane.
                     keep_out[a.xid] = self.layout.cells - {start[a.xid]}
@@ -1597,7 +1567,8 @@ class Coordinator:
         for agent in sorted((a for a in rest if a.task), key=lambda a: a.task.seq):
             settle(agent, agent.want)
         if self.queue:
-            for agent, slot in self._line_up(idle, start, cells - taken - frozenset().union(*zones.values()), passable):
+            unclaimed = cells - taken - frozenset().union(*claims.values())
+            for agent, slot in self._line_up(idle, start, unclaimed, passable):
                 settle(agent, slot)
         else:
             for agent in idle:
@@ -1614,8 +1585,8 @@ class Coordinator:
             log.error("cannot plan %s: %s", order, e)
             self._retry_at = now + 1.0
             return
-        motion = mapf.Motion(self.layout.pitch, getattr(self.driver, "speed", 0.5), getattr(self.driver, "accel", 2.0))
-        result = mapf.plan(instance, timeout=self.plan_timeout, budget=self.plan_budget, motion=motion)
+        motions = [mapf.Motion(self.layout.pitch, *self.speed_of(self.agents[x])) for x in order]
+        result = mapf.plan(instance, timeout=self.plan_timeout, budget=self.plan_budget, motion=motions)
         moved = len(result.configs) > 1
         substituted = any(goals[a.xid] != a.desired for a in movers)
         log.log(logging.INFO if moved else logging.DEBUG, "plan for %s: %d steps%s, %d expanded, %.0f ms",
@@ -1653,58 +1624,19 @@ class Coordinator:
         if here not in claimed:
             return None
         others = {s for x, s in start.items() if x != agent.xid}
-        seen = {here}
-        queue = deque([here])
-        while queue:
-            v = queue.popleft()
-            for u in self.graph[v]:
-                if u in seen or u not in free or u in others:
-                    continue
-                if u not in claimed:
-                    return u
-                seen.add(u)
-                queue.append(u)
-        return None
+        return next((u for u in self._steps_from(here, free - others) if u not in claimed), None)
 
     def _steps_from(self, origin, passable, reverse=False):
         """Steps from origin to every slot it can reach across passable ones (reverse: to origin)."""
-        graph = self.graph_reverse if reverse else self.graph
-        steps = {origin: 0}
-        queue = deque([origin])
-        while queue:
-            v = queue.popleft()
-            for u in graph[v]:
-                if u in passable and u not in steps:
-                    steps[u] = steps[v] + 1
-                    queue.append(u)
-        return steps
+        return steps_from(self.graph_reverse if reverse else self.graph, origin, passable)
 
     def _reachable(self, start, goal, free):
-        if start == goal:
-            return True
-        seen = {start}
-        queue = deque([start])
-        while queue:
-            v = queue.popleft()
-            for u in self.graph[v]:
-                if u == goal:
-                    return True
-                if u in free and u not in seen:
-                    seen.add(u)
-                    queue.append(u)
-        return False
+        """Whether goal can be reached from start across free slots (goal itself need not be free)."""
+        return goal == start or goal in self._steps_from(start, free | {goal})
 
     def _closest_free(self, start, near, usable, free):
         """The usable cell reachable from start that is closest to near (start itself if it is usable)."""
-        reach = {start}
-        queue = deque([start])
-        while queue:
-            v = queue.popleft()
-            for u in self.graph[v]:
-                if u in free and u not in reach:
-                    reach.add(u)
-                    queue.append(u)
-        candidates = [c for c in reach if c in usable]
+        candidates = [c for c in self._steps_from(start, free) if c in usable]
         if not candidates:
             return start
         if self.lines:
@@ -1728,12 +1660,23 @@ class Coordinator:
 
     # --- sending motions ---------------------------------------------------------------------
 
+    def _in_trail(self, agent, box, now):
+        """Whether box reaches into the trail of another xbot's move in flight (Layout.trail) that
+        still has far to go (TRAIL_WAIT_S, or paused): the PMC would stop a move into it."""
+        for other in self.agents.values():
+            m = other.motion
+            if other is agent or m is None or m.trail is None or not overlap(box, m.trail):
+                continue
+            if other.paused_at is not None or m.expected - (now - m.sent) > TRAIL_WAIT_S:
+                return True
+        return False
+
     def _dispatch(self, now):
         for agent in self.agents.values():
             if agent.motion is not None or agent.fault or agent.paused_at is not None:
                 continue
             if agent.ops:
-                if agent.zone is None or self._zone_clear(agent):
+                if agent.claim is None or self._claim_clear(agent):
                     self._send_op(agent, now)
                 continue
             if not agent.actions:
@@ -1750,13 +1693,16 @@ class Coordinator:
                     break
                 run.append(action)
             x, y = self.layout.center(run[-1].to)
+            origin = self.layout.center(run[0].frm)
+            if self._in_trail(agent, self.layout.ahead(origin, (x, y)), now):
+                continue
             try:
-                expected = self.driver.move(agent.xid, x, y)
+                expected = self.driver.move(agent.xid, x, y, *self.speed_of(agent))
             except DriverError as e:
                 log.error("xbot %d: move refused: %s", agent.xid, e)
                 self._fail(agent, ErrorID.PMC_ERROR)
                 continue
             for _ in run:
                 agent.actions.popleft()
-            origin = self.layout.center(run[0].frm)
-            agent.motion = Motion("nav", (x, y), now, expected, run, origin, step)
+            expected /= self._zone_speed({a.frm for a in run} | {a.to for a in run})
+            agent.motion = Motion("nav", (x, y), now, expected, run, origin, step, self.layout.trail(origin, (x, y)))

@@ -150,7 +150,10 @@ def check(layout, args, logs):
             last = said[-1] if said else (scenario.stderr.strip().splitlines() or ["no output"])[-1]
             passed, text = scenario.returncode == 0, last + "".join(f"\n      {p}" for p in problems[:3])
             if passed and args.mastership:
-                passed, what = asyncio.run(_mastership(endpoint, args.pmc_ip))
+                try:
+                    passed, what = asyncio.run(_mastership(endpoint, args.pmc_ip))
+                except Exception as e:  # the second session's pmclib or OPC UA client
+                    passed, what = False, f"mastership: {e!r}"
                 text += f"\n      {what}"
             return passed, text
         finally:

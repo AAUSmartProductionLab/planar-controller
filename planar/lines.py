@@ -53,6 +53,8 @@ import urllib.request
 from collections import deque
 from dataclasses import dataclass
 
+from .layout import steps_from
+
 
 # A point of the layout is on a spot or a flyway border this close (the points are in whole mm).
 POINT_TOLERANCE_M = 0.0005
@@ -264,14 +266,7 @@ class Lines:
         lanes = self.lane_cells
         first = min(lanes)
         for edges, way in ((self.graph, "to"), (self.reverse, "from")):
-            seen, queue = {first}, deque([first])
-            while queue:
-                v = queue.popleft()
-                for u in edges[v]:
-                    if u in lanes and u not in seen:
-                        seen.add(u)
-                        queue.append(u)
-            missing = sorted(lanes - seen)
+            missing = sorted(lanes - steps_from(edges, first, lanes).keys())
             if missing:
                 a, b = (first, missing[0]) if way == "to" else (missing[0], first)
                 raise LineError(f"the lanes lead nowhere from {self._mm(a)} to {self._mm(b)}: "

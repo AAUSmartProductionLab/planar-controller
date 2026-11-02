@@ -59,11 +59,11 @@ def test_one_xbot_goes_around_the_hole():
 
 
 def test_two_xbots_pass_in_a_one_lane_passage_and_a_parked_one_makes_way():
-    # Lane j=1 is walled by held xbots except the pockets at i=0, 4 and 7.
+    # Lane j=1 is walled by pinned xbots except the pockets at i=0, 4 and 7.
     walls = {10 + i: (*c(i, 1), 0.0) for i in (1, 2, 3, 5, 6)}
     h = Harness(STRIP, {1: (*c(0, 0), 0.0), 2: (*c(7, 0), 0.0), 3: (*c(4, 0), 0.0), **walls})
     for xid in walls:
-        h.coord.hold(xid, True)
+        h.coord.pin(xid, True)
     assert h.send(1, *c(7, 0)) == ErrorID.NONE
     assert h.send(2, *c(0, 0)) == ErrorID.NONE
     assert h.run(120, h.done(1, 2))
@@ -71,14 +71,14 @@ def test_two_xbots_pass_in_a_one_lane_passage_and_a_parked_one_makes_way():
     h.run(10)
     assert h.sim.at(3, *c(4, 0)), "the parked xbot is back where it was"
     for xid, pose in walls.items():
-        assert h.sim.at(xid, pose[0], pose[1]), "held xbots never move"
+        assert h.sim.at(xid, pose[0], pose[1]), "pinned xbots never move"
     h.assert_no_collisions()
 
 
-def test_a_held_xbot_is_never_pushed_and_the_task_waits_then_fails():
+def test_a_pinned_xbot_is_never_pushed_and_the_task_waits_then_fails():
     h = Harness(STRIP, {1: (*c(0, 0), 0.0), 2: (*c(3, 0), 0.0), 3: (*c(3, 1), 0.0)}, patience_s=5)
-    h.coord.hold(2, True)
-    h.coord.hold(3, True)
+    h.coord.pin(2, True)
+    h.coord.pin(3, True)
     assert h.send(1, *c(7, 0)) == ErrorID.NONE
     assert h.run(20, h.done(1))
     ok, error, _ = h.results[1][0]
@@ -103,8 +103,8 @@ def test_rotation_happens_at_a_cleared_flyway_centre():
 
 def test_docking_between_slots_and_at_a_flyway_centre():
     h = Harness(SIM, {1: (0.12, 0.12, 0.0), 2: (*c(7, 5), 0.0)})  # 1 starts docked on a flyway centre
-    h.coord.hold(1, True)  # occupied, as an orchestrator's xbots are: they stay where they arrive
-    h.coord.hold(2, True)
+    h.coord.pin(1, True)  # occupied, as an orchestrator's xbots are: they stay where they arrive
+    h.coord.pin(2, True)
     assert h.send(1, 0.24, 0.42) == ErrorID.NONE      # straddles four slots
     assert h.send(2, 0.84, 0.36, rz_deg=45) == ErrorID.NONE  # flyway (3, 1) centre, 45 degrees
     assert h.run(40, h.done(1, 2))
@@ -145,7 +145,7 @@ def test_halt_ends_interrupted_on_a_slot_and_abort_stops_at_once():
     with h.lock:
         h.coord.halt(1)
         h.coord.abort(2)
-        h.coord.hold(2, True)  # its shuttle module is Aborted: it stays put
+        h.coord.pin(2, True)  # its shuttle module is Aborted: it stays put
     assert h.run(10, h.done(1))
     ok, error, _ = h.results[1][0]
     assert not ok and error == ErrorID.INTERRUPTED
@@ -194,8 +194,8 @@ def test_random_traffic(layout, n, seed):
 
 def test_a_target_a_millimetre_off_a_slot_centre_is_reached_exactly_and_covers_both_slots():
     h = Harness(SIM, {1: (*c(0, 0), 0.0), 2: (*c(5, 0), 0.0)}, patience_s=3)
-    h.coord.hold(1, True)
-    h.coord.hold(2, True)
+    h.coord.pin(1, True)
+    h.coord.pin(2, True)
     x1 = c(1, 0)[0] + 0.001  # reaches 1 mm into slot (2, 0)
     assert h.send(1, x1, c(1, 0)[1]) == ErrorID.NONE
     assert h.run(20, h.done(1))
@@ -216,8 +216,8 @@ def test_xbots_off_the_lattice_may_touch_where_they_share_slots():
     # What was tried by hand: 2 parked on the flyway centre (120, 120), 1 sent to (240, 120),
     # which shares two slots with it but only touches it at x = 180 mm.
     h = Harness(SIM, {1: (0.30, 0.18, 0.0), 2: (0.12, 0.12, 0.0)}, patience_s=10)
-    h.coord.hold(1, True)
-    h.coord.hold(2, True)
+    h.coord.pin(1, True)
+    h.coord.pin(2, True)
     assert h.send(1, 0.24, 0.12) == ErrorID.NONE
     assert h.run(20, h.done(1))
     assert h.results[1][0][0], h.results
@@ -237,7 +237,7 @@ def test_xbots_off_the_lattice_may_touch_where_they_share_slots():
 def test_leaving_a_shared_slot_steps_onto_one_the_neighbour_does_not_reach_into():
     # 1 at (240, 120) touches 2 at (120, 120); slots (1, 0) and (1, 1) are under both.
     h = Harness(SIM, {1: (0.24, 0.12, 0.0), 2: (0.12, 0.12, 0.0)})
-    h.coord.hold(2, True)
+    h.coord.pin(2, True)
     assert h.send(1, *c(0, 4)) == ErrorID.NONE  # nearest way out would be through slot (1, 1)
     assert h.run(30, h.done(1))
     assert h.results[1][0][0], h.results
@@ -249,14 +249,14 @@ def test_leaving_a_shared_slot_steps_onto_one_the_neighbour_does_not_reach_into(
 
 def test_a_turn_on_a_flyway_centre_waits_for_a_neighbour_reaching_into_it():
     h = Harness(SIM, {1: (0.12, 0.12, 0.0), 2: (0.24, 0.12, 0.0)}, patience_s=3)
-    h.coord.hold(1, True)
-    h.coord.hold(2, True)
+    h.coord.pin(1, True)
+    h.coord.pin(2, True)
     assert h.send(1, 0.12, 0.12, rz_deg=90) == ErrorID.NONE  # its corners would sweep into 2
     assert h.run(10, h.done(1))
     ok, error, _ = h.results[1][0]
     assert not ok and error == ErrorID.BLOCKED
     assert not [cmd for cmd in h.sim.commands if cmd[2] == "rotate"]
-    h.coord.hold(2, False)  # 2 is let go: it steps back onto a slot, out of the way
+    h.coord.pin(2, False)  # 2 is let go: it steps back onto a slot, out of the way
     h.run(3)
     assert h.send(1, 0.12, 0.12, rz_deg=90) == ErrorID.NONE
     assert h.run(10, lambda: len(h.results[1]) == 2)
@@ -269,7 +269,7 @@ def test_requests_for_a_taken_place_wait_and_are_served_oldest_first():
     # only after more than a minute. 3 (the older request) gets the place, 1 the next turn.
     h = Harness(SIM, {1: (*c(6, 4), 0.0), 2: (0.12, 0.12, 0.0), 3: (*c(6, 0), 0.0)})
     for xid in (1, 2, 3):
-        h.coord.hold(xid, True)
+        h.coord.pin(xid, True)
     assert h.send(3, 0.12, 0.12) == ErrorID.NONE
     h.run(1)
     assert h.send(1, 0.12, 0.12) == ErrorID.NONE
@@ -287,8 +287,8 @@ def test_requests_for_a_taken_place_wait_and_are_served_oldest_first():
 
 def test_requests_made_at_once_for_the_same_place_do_not_wait_for_each_other():
     h = Harness(SIM, {1: (*c(0, 4), 0.0), 2: (*c(3, 0), 0.0)})
-    h.coord.hold(1, True)
-    h.coord.hold(2, True)
+    h.coord.pin(1, True)
+    h.coord.pin(2, True)
     assert h.send(1, *c(1, 1)) == ErrorID.NONE
     assert h.send(2, *c(1, 1)) == ErrorID.NONE  # the same tick
     assert h.run(20, h.done(1))
@@ -299,18 +299,18 @@ def test_requests_made_at_once_for_the_same_place_do_not_wait_for_each_other():
 def test_a_short_move_with_nothing_in_the_way_is_one_straight_move():
     # By hand: from (850, 120) to (850, 240) it went over a slot centre, corner to corner.
     h = Harness(SIM, {1: (0.85, 0.12, 0.0), 2: (*c(0, 5), 0.0)})
-    h.coord.hold(1, True)
+    h.coord.pin(1, True)
     assert h.send(1, 0.85, 0.24) == ErrorID.NONE
     assert h.run(10, h.done(1))
     assert h.results[1][0][0]
     moves = [cmd for cmd in h.sim.commands if cmd[1] == 1]
-    assert len(moves) == 1 and moves[0][2:] == ("move", 0.85, 0.24), moves
+    assert len(moves) == 1 and moves[0][2:5] == ("move", 0.85, 0.24), moves
 
 
 def test_a_longer_route_has_one_corner_not_a_staircase():
     # 2 stands in the box of the straight line, so 1 is planned: right, then up.
     h = Harness(SIM, {1: (*c(0, 0), 0.0), 2: (*c(1, 2), 0.0)})
-    h.coord.hold(2, True)
+    h.coord.pin(2, True)
     assert h.send(1, *c(3, 5)) == ErrorID.NONE
     assert h.run(20, h.done(1))
     assert h.results[1][0][0]
@@ -324,7 +324,7 @@ def test_into_and_out_of_a_gap_between_two_xbots_it_touches_on_both_sides():
     # partly under one of them, so the way in is from above, straight down; and out the same way.
     h = Harness(SIM, {1: (0.12, 0.12, 0.0), 2: (*c(1, 4), 0.0), 3: (0.36, 0.12, 0.0)})
     for xid in (1, 2, 3):
-        h.coord.hold(xid, True)
+        h.coord.pin(xid, True)
     assert h.send(2, 0.24, 0.12) == ErrorID.NONE
     assert h.run(20, h.done(2))
     assert h.results[2][0][0], h.results
@@ -340,7 +340,7 @@ def test_three_xbots_touching_in_a_row_change_places_round():
     row = {1: (0.12, 0.12), 2: (0.24, 0.12), 3: (0.36, 0.12)}
     h = Harness(SIM, {x: (*p, 0.0) for x, p in row.items()})
     for xid in row:
-        h.coord.hold(xid, True)
+        h.coord.pin(xid, True)
     nxt = {1: row[2], 2: row[3], 3: row[1]}
     for xid, p in nxt.items():
         assert h.send(xid, *p) == ErrorID.NONE
@@ -355,7 +355,7 @@ def test_many_requests_at_once_for_one_place_are_served_in_the_order_they_were_m
     parks = {1: c(1, 0), 2: c(6, 0), 3: c(1, 5), 4: c(6, 5), 5: c(4, 0)}
     h = Harness(SIM, {x: (*p, 0.0) for x, p in starts.items()})
     for xid in starts:
-        h.coord.hold(xid, True)
+        h.coord.pin(xid, True)
     spot = (0.36, 0.60)  # a flyway centre
     for xid in (4, 2, 5, 1, 3):  # the order of the requests, all in the same tick
         assert h.send(xid, *spot) == ErrorID.NONE
@@ -376,7 +376,7 @@ def test_many_requests_at_once_for_one_place_are_served_in_the_order_they_were_m
 def test_stopping_the_oldest_waiting_request_lets_the_next_one_in():
     h = Harness(SIM, {1: (0.12, 0.12, 0.0), 2: (*c(6, 4), 0.0), 3: (*c(6, 0), 0.0)})
     for xid in (1, 2, 3):
-        h.coord.hold(xid, True)
+        h.coord.pin(xid, True)
     assert h.send(2, 0.12, 0.12) == ErrorID.NONE  # 1 is there: 2 waits, 3 waits behind 2
     assert h.send(3, 0.12, 0.12) == ErrorID.NONE
     h.run(5)
@@ -393,10 +393,10 @@ def test_stopping_the_oldest_waiting_request_lets_the_next_one_in():
 
 def test_a_new_request_is_planned_while_others_are_on_their_way():
     # 1 goes the long way along row 0 (the straight box is not free: 4 is in it); while it is on
-    # its way, 2 is sent around the held 3. 2 must not wait for 1 to arrive before it sets off.
+    # its way, 2 is sent around the pinned 3. 2 must not wait for 1 to arrive before it sets off.
     h = Harness(SIM, {1: (*c(0, 0), 0.0), 2: (*c(0, 5), 0.0), 3: (*c(1, 5), 0.0), 4: (*c(5, 1), 0.0)})
     for xid in (3, 4):
-        h.coord.hold(xid, True)
+        h.coord.pin(xid, True)
     assert h.send(1, *c(7, 1)) == ErrorID.NONE
     assert h.run(5, lambda: h.sim.xbots[1].motion is not None)
     h.run(0.1)
@@ -405,6 +405,24 @@ def test_a_new_request_is_planned_while_others_are_on_their_way():
     assert h.sim.xbots[1].motion is not None, "2 set off while 1 was still on its way"
     assert h.run(30, h.done(1, 2))
     assert h.results[1][0][0] and h.results[2][0][0], h.results
+    h.assert_no_collisions()
+
+
+def test_a_follower_is_not_sent_into_the_trail_of_a_move_still_on_its_way():
+    # The PMC stops a move into what another's move in flight keeps clear, the slots it has left
+    # and one behind them (Layout.trail), while that move has far to go: 2 sets off into 1's
+    # first slot only once 1 is nearly at the end of its run along row 0, else the simulated PMC
+    # stops it. (3, pinned, keeps 1 from going straight there: its way is planned, and the slots
+    # it leaves are free for the planner at once.)
+    h = Harness(STRIP, {1: (*c(2, 0), 0.0), 2: (*c(1, 0), 0.0), 3: (*c(5, 1), 0.0)})
+    h.coord.pin(3, True)
+    assert h.send(1, *c(7, 1)) == ErrorID.NONE
+    assert h.run(5, lambda: h.sim.xbots[1].x > c(4, 0)[0])
+    assert h.send(2, *c(2, 0)) == ErrorID.NONE
+    assert h.run(10, lambda: any(cmd[1:3] == (2, "move") for cmd in h.sim.commands))
+    assert h.sim.xbots[1].x > c(5, 0)[0], "2 set off into 1's trail with 1 far from the end of it"
+    assert h.run(30, h.done(1, 2))
+    assert [r[0][:2] for r in (h.results[1], h.results[2])] == [(True, ErrorID.NONE)] * 2, h.results
     h.assert_no_collisions()
 
 
@@ -418,8 +436,8 @@ def test_two_turns_may_wait_for_their_flyways_to_clear_at_once():
         assert h.coord._claim(a1, (SIM.flyway_box((0, 0)),))
         assert h.coord._claim(a2, (SIM.flyway_box((3, 2)),)), "a second claim waits alongside the first"
     h.coord.agents[1].task = h.coord.agents[2].task = None
-    h.coord.agents[1].zone = h.coord.agents[2].zone = None
-    h.coord.agents[1].zone_boxes = h.coord.agents[2].zone_boxes = ()
+    h.coord.agents[1].claim = h.coord.agents[2].claim = None
+    h.coord.agents[1].claim_boxes = h.coord.agents[2].claim_boxes = ()
     assert h.send(1, *c(0, 0), rz_deg=90) == ErrorID.NONE
     assert h.send(2, *c(6, 4), rz_deg=90) == ErrorID.NONE
     assert h.run(30, h.done(1, 2))
@@ -429,12 +447,12 @@ def test_two_turns_may_wait_for_their_flyways_to_clear_at_once():
 
 
 def test_a_claim_that_would_leave_no_way_out_is_not_made():
-    # On the strip: 3 idles in flyway (1, 0); the held 5 and 6 wall it off on the left. With 2's
+    # On the strip: 3 idles in flyway (1, 0); the pinned 5 and 6 wall it off on the left. With 2's
     # claim on flyway (2, 0) it could not get out of 1's claim on (1, 0) to anywhere.
     h = Harness(STRIP, {1: (*c(3, 1), 0.0), 2: (*c(5, 1), 0.0), 3: (*c(2, 0), 0.0),
                         5: (*c(1, 0), 0.0), 6: (*c(1, 1), 0.0)})
     for xid in (5, 6):
-        h.coord.hold(xid, True)
+        h.coord.pin(xid, True)
     h.run(0.1)
     with h.lock:
         a1, a2 = h.coord.agents[1], h.coord.agents[2]
@@ -458,7 +476,7 @@ def test_idle_xbots_queue_up_at_the_loading_station():
     # The first one is taken (occupied) for a product and sent off; the queue closes up, with
     # the fewest moves: the one at (0, 2) onto the station, the one at (0, 0) stays.
     first, second, third = order
-    h.coord.hold(first, True)
+    h.coord.pin(first, True)
     sent = h.t
     assert h.send(first, *c(7, 5)) == ErrorID.NONE
     assert h.run(30, h.done(first))
@@ -488,12 +506,12 @@ def test_a_request_replaces_a_turn_to_the_idle_orientation():
     h = Harness(SIM, {1: (*c(0, 0), math.radians(90))}, idle_rz=0.0)
     assert h.run(1, lambda: h.coord.agents[1].task is not None)
     assert h.coord.agents[1].task.internal
-    h.coord.hold(1, True)
+    h.coord.pin(1, True)
     assert h.send(1, *c(7, 5), rz_deg=90) == ErrorID.NONE, "not Busy: the turn gives way"
     assert h.run(30, h.done(1))
     assert h.results[1][0][0] and h.sim.at(1, *c(7, 5), math.radians(90))
     h.run(5)
-    assert h.sim.at(1, *c(7, 5), math.radians(90)), "held: it stays as it was sent"
+    assert h.sim.at(1, *c(7, 5), math.radians(90)), "pinned: it stays as it was sent"
     h.assert_no_collisions()
 
 

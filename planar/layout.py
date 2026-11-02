@@ -12,6 +12,7 @@ Positions are in metres and radians, as pmclib uses them.
 
 import math
 import xml.etree.ElementTree as ET
+from collections import deque
 from dataclasses import dataclass
 from functools import cached_property
 
@@ -28,6 +29,9 @@ EXACT_M = 1e-6
 # How close a move has to end to its target to have arrived, and an xbot to a spot to turn.
 POSITION_TOLERANCE_M = 0.0005
 ANGLE_TOLERANCE_RAD = 0.005
+# A move's trail (Layout.trail) reaches this far beyond the box it sweeps: the PMC stops another
+# xbot sent to touch it, even at a corner.
+TRAIL_MARGIN_M = 0.001
 
 
 def wrap_angle(rz):
@@ -53,6 +57,20 @@ def overlap(a, b):
 def hull(*boxes):
     """The smallest box around boxes: what a straight move from one to another sweeps, and more."""
     return (min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes))
+
+
+def steps_from(graph, origin, passable=None):
+    """{slot: steps from origin} for every slot reachable along graph ({slot: [slots]}), entering
+    only passable ones (None: any); in the order they are reached."""
+    steps = {origin: 0}
+    queue = deque([origin])
+    while queue:
+        v = queue.popleft()
+        for u in graph[v]:
+            if u not in steps and (passable is None or u in passable):
+                steps[u] = steps[v] + 1
+                queue.append(u)
+    return steps
 
 
 def is_square_aligned(rz, tolerance=ANGLE_TOLERANCE_RAD):
@@ -146,6 +164,26 @@ class Layout:
     def cell_box(self, cell):
         x, y = self.center(cell)
         return self.square(x, y)
+
+    def trail(self, start, target):
+        """What the PMC keeps clear for a straight move from start to target, as Planar Motor's
+        simulator does: the box the move sweeps, from a slot back from its start, and whatever
+        touches it (TRAIL_MARGIN_M). A move of another xbot into it is stopped with
+        XBOT_OBSTACLE_DETECTED while the move still has more than about 0.65 s to go, though the
+        xbot has long left those slots."""
+        (sx, sy), (tx, ty) = start, target
+        d = math.hypot(tx - sx, ty - sy)
+        k = self.pitch / d if d > EXACT_M else 0.0
+        x0, y0, x1, y1 = hull(self.square(sx - (tx - sx) * k, sy - (ty - sy) * k), self.square(tx, ty))
+        m = TRAIL_MARGIN_M
+        return (x0 - m, y0 - m, x1 + m, y1 + m)
+
+    def ahead(self, start, target):
+        """The box a straight move from start to target sweeps beyond the slot it starts on."""
+        (sx, sy), (tx, ty) = start, target
+        d = math.hypot(tx - sx, ty - sy)
+        k = min(1.0, self.pitch / d) if d > EXACT_M else 1.0
+        return hull(self.square(sx + (tx - sx) * k, sy + (ty - sy) * k), self.square(tx, ty))
 
     def flyway_box(self, flyway):
         c, r = flyway

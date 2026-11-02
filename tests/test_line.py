@@ -1,4 +1,5 @@
-"""The production line of line_scenario.py, through OPC UA, on the simulated driver."""
+"""The production line of line_scenario.py, through OPC UA, on the simulated driver: in real time,
+so most of these are slow."""
 
 import asyncio
 import math
@@ -30,8 +31,8 @@ async def _line(agents, products, seed, loading_station=None, sample=False, plac
     # Three xbots on the flyway centres of the left column, as in the simulation tool; fast moves
     # (turns slow enough to be sampled when the shuttles are watched).
     sim = SimDriver(SIM, {1: (0.12, 0.12, 0.0), 2: (0.12, 0.36, 0.0), 3: (0.12, 0.60, 0.0)},
-                    speed=2.0, accel=10.0, turn_speed=turn_speed, turn_accel=10 * turn_speed)
-    ctl = PlanarController(sim, [1, 2, 3], loading_station=loading_station, **kw)
+                    turn_speed=turn_speed, turn_accel=10 * turn_speed)
+    ctl = PlanarController(sim, [1, 2, 3], speed=2.0, accel=10.0, loading_station=loading_station, **kw)
     ctl.coordinator.on_tick.insert(0, lambda: sim.advance(time.monotonic()))
     endpoint = f"opc.tcp://127.0.0.1:{free_port()}/"
     server = OpcUaServer(ctl, endpoint)
@@ -56,6 +57,7 @@ def _settings(path):
 INFEED = (0.06, 0.18)  # line_scenario.STATIONS["Infeed"], where the products are put on
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("agents,products,seed,loading_station", [(3, 4, 1, None), (4, 3, 2, None), (3, 4, 3, INFEED)])
 def test_product_agents_run_the_line(agents, products, seed, loading_station):
     report, sim = asyncio.run(_line(agents, products, seed, loading_station))
@@ -70,6 +72,7 @@ def test_product_agents_run_the_line(agents, products, seed, loading_station):
         assert report.occupy_refusals > 0, "four agents share three shuttles"
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("folder", LAYOUTS, ids=lambda p: p.name)
 def test_each_layout_of_config_layouts_runs_the_line(folder):
     """config/layouts/<name>/: its layout and settings, its stations; the shuttles watched."""
@@ -87,6 +90,7 @@ def test_each_layout_of_config_layouts_runs_the_line(folder):
     assert all(abs(turn) <= math.pi + 1e-9 for _, turn in sim.turns)
 
 
+@pytest.mark.slow
 def test_the_line_runs_on_with_the_table_held_now_and_then_and_nothing_moves_while_it_is():
     folder = LAYOUTS[0]
     report, sim = asyncio.run(_line(3, 3, 1, sample=True, places=read_stations(folder / "stations.json"),

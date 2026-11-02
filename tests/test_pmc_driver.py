@@ -4,6 +4,7 @@ import importlib.util
 import math
 import sys
 import types
+from enum import IntEnum
 from pathlib import Path
 
 import pytest
@@ -23,11 +24,12 @@ class _Names:
 
 
 def _load(monkeypatch, state, enums=("XBOTSTATE", "PMCSTATUS", "ROTATIONMODE", "POSITIONMODE", "LINEARPATHTYPE",
-                                      "LEVITATEOPTIONS", "MOTIONINTERRUPTOPTIONS", "MOVERPROPERTY")):
+                                      "LEVITATEOPTIONS", "MOTIONINTERRUPTOPTIONS")):
     """planar/pmc_driver.py on a stand-in pmclib with these enums."""
     pm = types.ModuleType("pmclib.pmc_types")
     for enum in enums:
         setattr(pm, enum, _Names())
+    pm.MOVERPROPERTY = IntEnum("MOVERPROPERTY", {"MAXACCELERATION_7": 7})
     pm.ALLXBOTSFEEDBACKOPTION = lambda value: value
     pm.XBotPayloadSettings = lambda *values: values
     xbot = types.ModuleType("pmclib.xbot_commands")
@@ -48,9 +50,12 @@ def _load(monkeypatch, state, enums=("XBOTSTATE", "PMCSTATUS", "ROTATIONMODE", "
     xbot.read_xbot_payload_settings = lambda xid: types.SimpleNamespace(
         payloadkg=state.get("payload", (0.0,))[0], payload_cg_heightm=0.0, payload_dimension_xm=0.12,
         payload_dimension_ym=0.12)
-    xbot.get_mover_properties = lambda xid, start: types.SimpleNamespace(
-        valid_properties_count=1, mover_properties=[types.SimpleNamespace(
-            property_id=_Member("MAXACCELERATION_7"), property_value=state.get("max_accel", 20.0))])
+    def mover_properties(xid, start):
+        if type(start) is not int:  # as pmclib asserts: an int, not one of its IntEnums
+            raise TypeError(f"starting_property_id expected {int}, got {type(start)}")
+        return types.SimpleNamespace(valid_properties_count=1, mover_properties=[types.SimpleNamespace(
+            property_id=pm.MOVERPROPERTY(start), property_value=state.get("max_accel", 20.0))])
+    xbot.get_mover_properties = mover_properties
     package = types.ModuleType("pmclib")
     package.pmc_types, package.xbot_commands = pm, xbot
     package.system_commands = types.ModuleType("pmclib.system_commands")
@@ -126,14 +131,14 @@ def test_an_xbot_the_pmc_switched_off_after_an_accident_reads_so(pmc):
     assert (reading.state, reading.detail) == ("off", "ACCIDENT (XBOT_DISABLED)")
 
 
-def test_a_hold_pauses_every_xbot_and_unhold_resumes_them(pmc):
+def test_an_xbots_motion_is_paused_and_resumed(pmc):
     driver, state = pmc
-    driver.pause(0)
+    driver.pause(2)
     driver.resume(2)
-    assert state["sent"] == [("PAUSE", 1), ("PAUSE", 2), ("RESUME", 2)]
+    assert state["sent"] == [("PAUSE", 2), ("RESUME", 2)]
 
 
-def test_a_payload_the_xbot_does_not_take_is_out_of_range_and_one_it_does_slows_its_moves(pmc):
+def test_a_payload_the_xbot_does_not_take_is_out_of_range_and_one_it_does_gives_its_max_acceleration(pmc):
     driver, state = pmc
     module = _module(driver)
     with pytest.raises(module.DriverError) as e:
@@ -142,7 +147,10 @@ def test_a_payload_the_xbot_does_not_take_is_out_of_range_and_one_it_does_slows_
     state["max_accel"] = 1.2
     assert driver.set_payload(1, 0.4, 0.02) == 1.2
     assert state["payload"] == (0.4, 0.02, 0.12, 0.12), "its size left as the PMC has it"
-    driver.move(1, 0.36, 0.36)
-    assert state["sent"][-1][9] == 1.2, "its moves keep to the acceleration the PMC allows with the payload"
-    driver.move(2, 0.36, 0.36)
-    assert state["sent"][-1][9] == driver.accel
+
+
+def test_a_move_is_sent_with_the_speed_and_acceleration_it_is_given(pmc):
+    driver, state = pmc
+    assert driver.move(1, 0.36, 0.48, 0.3, 1.2) == 1.0
+    (_, _, xid, _, _, x, y, final_speed, speed, accel, _), = state["sent"]
+    assert (xid, x, y, final_speed, speed, accel) == (1, 0.36, 0.48, 0.0, 0.3, 1.2)

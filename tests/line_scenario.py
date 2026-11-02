@@ -284,6 +284,9 @@ class MotionCheck:
     way (line mode), a turn off a turn spot or by more than half a turn."""
 
     SETTLED_S = 0.3  # a turn is over when the angle has not changed for this long
+    # Less is not a turn (every turn is to a multiple of 90 deg): Planar Motor's simulator's xbot
+    # yaws by a degree or so now and then on a diagonal move.
+    JITTER_DEG = 5.0
 
     def __init__(self, table, lines, report):
         self.table, self.lines, self.report = table, lines, report
@@ -322,11 +325,13 @@ class MotionCheck:
                 self.turning[shuttle][3] = now  # paused half way: it goes on once unheld
             elif shuttle in self.turning and now - self.turning[shuttle][3] > self.SETTLED_S:
                 tx, ty, swept, _ = self.turning.pop(shuttle)
-                self.report.turns.append((shuttle, round(tx), round(ty), round(swept)))
-                if not self._on_spot(tx, ty):
-                    self.report.problem(f"{shuttle} turned at ({tx:.0f}, {ty:.0f}) mm, not on a turn spot")
-                if abs(swept) > 180.5:
-                    self.report.problem(f"{shuttle} turned {swept:+.0f} deg at ({tx:.0f}, {ty:.0f}) mm, the long way")
+                if abs(swept) >= self.JITTER_DEG:
+                    self.report.turns.append((shuttle, round(tx), round(ty), round(swept)))
+                    if not self._on_spot(tx, ty):
+                        self.report.problem(f"{shuttle} turned at ({tx:.0f}, {ty:.0f}) mm, not on a turn spot")
+                    if abs(swept) > 180.5:
+                        self.report.problem(f"{shuttle} turned {swept:+.0f} deg at ({tx:.0f}, {ty:.0f}) mm, "
+                                            f"the long way")
         self.rz[shuttle] = rz
 
 

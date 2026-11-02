@@ -1,58 +1,16 @@
-"""Hold and Unhold, the payload, accidents, mastership, zones and the flyways' status, on the
-simulated table through the modules, as an orchestrator uses them."""
+"""Hold and Unhold, speed, the payload, accidents, mastership, zones and the flyways' status, on
+the simulated table through the modules, as an orchestrator uses them."""
+
+import math
 
 import pytest
 
-from planar.layout import Layout, overlap
-from planar.modules import PlanarController
-from planar.sim_driver import SimDriver
+from harness import SIM, Cell, c
+from planar.layout import overlap
 from planar.statemachines import ErrorID, ModuleState, SkillState
 from planar.zones import ZoneError, ZoneSpec, parse
 
-STRIP = Layout(cols=4, rows=1)  # 8 x 2 slots
-SIM = Layout(cols=4, rows=3, holes=frozenset({(2, 1)}))
 SERVICE = ZoneSpec("Service", (0.72, 0.48, 0.96, 0.72))  # SIM's flyway (3, 2): slots (6..7, 4..5)
-
-
-def c(i, j):
-    return ((i + 0.5) * 120.0, (j + 0.5) * 120.0)  # mm, as the skill takes them
-
-
-class Cell:
-    def __init__(self, xbots, layout=STRIP, **options):
-        self.t = 0.0
-        self.sim = SimDriver(layout, {xid: (x / 1000, y / 1000, 0.0) for xid, (x, y) in xbots.items()})
-        self.ctl = PlanarController(self.sim, sorted(xbots), clock=lambda: self.t, plan_timeout=0.3, **options)
-        self.coord = self.ctl.coordinator
-        self.table = self.ctl.table
-        self.s = self.ctl.shuttles
-        self.watch = None
-
-    def run(self, seconds, until=None):
-        for _ in range(int(seconds / 0.02)):
-            self.t += 0.02
-            self.sim.advance(self.t)
-            self.coord.tick(self.t)
-            if self.watch:
-                self.watch()
-            if until is not None and until():
-                return True
-        return until is None
-
-    def up(self):
-        assert self.table.command("Reset", "") == (True, ErrorID.NONE)
-        assert self.run(2, lambda: self.table.state == ModuleState.IDLE)
-        assert self.table.command("Start", "") == (True, ErrorID.NONE)
-        assert all(s.state == ModuleState.EXECUTE for s in self.s.values())
-
-    def skill(self, xid):
-        return self.s[xid].skills["MoveToPosition"]
-
-    def move(self, xid, session, x, y, rz=0.0):
-        return self.skill(xid).start(session, {"X": x, "Y": y, "Rz": rz})
-
-    def x(self, xid):
-        return self.sim.xbots[xid].x
 
 
 # --- Hold and Unhold -----------------------------------------------------------------------------
@@ -122,6 +80,68 @@ def test_an_abort_while_held_leaves_no_xbot_paused():
     assert cell.table.command("Abort", "") == (True, ErrorID.NONE)
     assert not any(xb.paused for xb in cell.sim.xbots.values()), "else the moves sent later would wait too"
     assert all(a.paused_at is None for a in cell.coord.agents.values())
+
+
+def test_the_pmc_pauses_only_the_motions_in_flight_each_once():
+    cell = Cell({1: c(0, 0), 2: c(0, 1)})
+    cell.up()
+    cell.s[1].occupation.occupy("A")
+    assert cell.move(1, "A", *c(7, 0)) == (True, ErrorID.NONE)
+    cell.run(0.5)
+    assert cell.table.command("Hold", "") == (True, ErrorID.NONE)  # holds shuttle 1, then pauses the table
+    assert cell.table.command("Unhold", "") == (True, ErrorID.NONE)
+    assert [cmd[1:] for cmd in cell.sim.commands if cmd[2] in ("pause", "resume")] == [(1, "pause"), (1, "resume")]
+    assert cell.run(10, lambda: cell.skill(1).state == SkillState.SUCCEEDED)
+
+
+def test_a_skill_stopped_while_held_stays_put_until_unheld_and_then_fails_interrupted():
+    cell = Cell({1: c(0, 0)})
+    cell.up()
+    cell.s[1].occupation.occupy("A")
+    assert cell.move(1, "A", *c(7, 0)) == (True, ErrorID.NONE)
+    cell.run(0.5)
+    assert cell.table.command("Hold", "") == (True, ErrorID.NONE)
+    cell.run(0.5)
+    x = cell.x(1)
+    assert cell.skill(1).stop("A") == (True, ErrorID.NONE)
+    cell.run(5)
+    assert cell.x(1) == x and cell.skill(1).state == SkillState.STOPPING, "held: nothing moves"
+    assert cell.table.command("Unhold", "") == (True, ErrorID.NONE)
+    assert cell.run(10, lambda: cell.skill(1).state == SkillState.FAILED)
+    assert cell.skill(1).error == ErrorID.INTERRUPTED
+
+
+# --- speed ---------------------------------------------------------------------------------------
+
+def test_the_tables_speed_and_a_shuttles_own_limit_set_how_fast_its_xbot_moves():
+    cell = Cell({1: c(0, 0), 2: c(3, 0)})
+    assert cell.ctl.set_speed(1, "", 0.2, 0.0) == (False, ErrorID.XBOT_NOT_DETECTED), "not before the first Reset"
+    cell.up()
+    cell.s[1].occupation.occupy("A")
+
+    def moves():
+        """{(speed, accel)} of xbot 1's motions there and back: past 2 (planned), and short of it (straight)."""
+        since = len(cell.sim.commands)
+        for to in (c(7, 0), c(0, 0), c(2, 0), c(0, 0)):
+            assert cell.move(1, "A", *to) == (True, ErrorID.NONE)
+            assert cell.run(60, lambda: cell.skill(1).state == SkillState.SUCCEEDED)
+            assert cell.run(3, lambda: cell.skill(1).state == SkillState.IDLE)
+        return {cmd[5:] for cmd in cell.sim.commands[since:] if cmd[1:3] == (1, "move")}
+
+    assert moves() == {(0.5, 2.0)}, "XBOT_SPEED's and XBOT_ACCEL's defaults"
+    assert cell.ctl.set_speed(None, "B", 1.0, 4.0) == (True, ErrorID.NONE), "anyone's while the table is free"
+    assert moves() == {(1.0, 4.0)}
+    assert cell.ctl.set_speed(1, "B", 0.2, 0.0) == (False, ErrorID.NOT_PERMITTED), "the occupant's"
+    assert cell.ctl.set_speed(1, "A", -0.2, 0.0) == (False, ErrorID.OUT_OF_RANGE)
+    assert cell.ctl.set_speed(1, "A", 0.2, 0.0) == (True, ErrorID.NONE)
+    assert moves() == {(0.2, 4.0)}, "its own speed, the table's acceleration"
+    assert cell.ctl.set_speed(1, "A", 2.0, 1.0) == (True, ErrorID.NONE)
+    assert moves() == {(1.0, 1.0)}, "never faster than the table"
+    assert cell.ctl.set_speed(None, "", math.nan, 0.0) == (True, ErrorID.NONE)
+    assert (cell.coord.speed, cell.coord.accel) == (0.5, 2.0), "the table's as it started"
+    assert cell.ctl.set_speed(1, "A", 0.0, math.nan) == (True, ErrorID.NONE)
+    assert moves() == {(0.5, 2.0)}, "none of its own"
+    assert not cell.sim.collisions
 
 
 # --- the payload ---------------------------------------------------------------------------------
@@ -252,6 +272,19 @@ def test_a_zone_switched_off_is_kept_clear_its_xbots_swapped_by_hand_and_switche
     cell.watch = None
     assert cell.move(1, "A", *c(6, 4)) == (True, ErrorID.NONE)
     assert cell.run(30, lambda: cell.skill(1).state == SkillState.SUCCEEDED)
+    assert not cell.sim.collisions
+
+
+def test_a_move_through_a_slow_zone_does_not_time_out_though_the_pmc_says_it_takes_less():
+    slow = ZoneSpec("Slow", (0.0, 0.0, 0.96, 0.24), 0.2)  # SIM's first row of flyways, at a fifth of the speed
+    cell = Cell({1: c(0, 1), 2: c(4, 0)}, layout=SIM, zones=[slow])
+    cell.up()
+    cell.s[1].occupation.occupy("A")
+    for to in (c(7, 1), c(0, 0)):  # straight there; then planned, past 2
+        assert cell.move(1, "A", *to) == (True, ErrorID.NONE)
+        assert cell.run(60, lambda: cell.skill(1).state != SkillState.RUNNING)
+        assert (cell.skill(1).state, cell.skill(1).error) == (SkillState.SUCCEEDED, ErrorID.NONE)
+        assert cell.run(3, lambda: cell.skill(1).state == SkillState.IDLE)
     assert not cell.sim.collisions
 
 

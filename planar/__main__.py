@@ -21,8 +21,9 @@ Environment (each also an option, see --help):
                   Reset of the table; its idleArea is the loading queue
   ZONES           zones of the table to switch off for loading xbots on and off, or to slow
                   down in: a JSON file or URL (see planar/zones.py); PlanarTable/Equipment/Zones
-  XBOT_SPEED      m/s (0.5), XBOT_ACCEL m/s^2 (2.0; less with a payload that allows less),
-                  XBOT_JERK m/s^3 (empty: the PMC's)
+  XBOT_SPEED      m/s (0.5) and XBOT_ACCEL m/s^2 (2.0) every xbot moves at, or slower (a
+                  shuttle's own SetSpeed, a payload the PMC allows less with); also
+                  PlanarTable/Equipment/SetSpeed over OPC UA. XBOT_JERK m/s^3 (empty: the PMC's)
   LOG_LEVEL       INFO
 
 It stops on Ctrl+C, Ctrl+Break and SIGTERM (docker stop), and then disconnects from the PMC.
@@ -37,7 +38,7 @@ import os
 import signal
 
 from . import lines, zones
-from .coordinator import DriverError
+from .driver import DriverError
 from .modules import PlanarController
 from .opcua_server import OpcUaServer
 from .pmc_driver import PmcDriver
@@ -46,8 +47,52 @@ from .statemachines import ModuleState
 log = logging.getLogger("planar")
 
 
+def _env(name, default=""):
+    return os.environ.get(name, "").strip() or default
+
+
 def _flag(name):
-    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+    return _env(name).lower() in ("1", "true", "yes", "on")
+
+
+def _number(text):
+    """A number; empty -> None."""
+    if not text.strip():
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {text!r}") from None
+
+
+def _positive(text):
+    """A number above 0."""
+    value = _number(text)
+    if value is None or not 0 < value < math.inf:
+        raise argparse.ArgumentTypeError(f"not a number above 0: {text!r}")
+    return value
+
+
+def _ids(text):
+    """ "1,2,3" -> [1, 2, 3]; empty -> None."""
+    if not text.strip():
+        return None
+    try:
+        return [int(x) for x in text.replace(" ", "").split(",") if x]
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not xbot ids like 1,2,3: {text!r}") from None
+
+
+def _mode(text):
+    if text.strip().lower() not in ("free", "line"):
+        raise argparse.ArgumentTypeError(f"free or line, not {text!r}")
+    return text.strip().lower()
+
+
+def _level(text):
+    if text.strip().upper() not in logging.getLevelNamesMapping():
+        raise argparse.ArgumentTypeError(f"DEBUG, INFO, WARNING or ERROR, not {text!r}")
+    return text.strip().upper()
 
 
 def _point_mm(text):
@@ -77,25 +122,23 @@ def _quarter_deg(text):
 def parse_args():
     p = argparse.ArgumentParser(prog="python -m planar", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--pmc-ip", default=os.environ.get("PMC_IP") or None)
-    p.add_argument("--endpoint", default=os.environ.get("OPCUA_ENDPOINT", "opc.tcp://0.0.0.0:4840/"))
-    p.add_argument("--shuttles", default=os.environ.get("SHUTTLES", ""))
+    # Each defaults to its environment variable, which argparse reads as if it were given here.
+    p.add_argument("--pmc-ip", default=_env("PMC_IP") or None)
+    p.add_argument("--endpoint", default=_env("OPCUA_ENDPOINT", "opc.tcp://0.0.0.0:4840/"))
+    p.add_argument("--shuttles", type=_ids, metavar="1,2,3", default=_env("SHUTTLES"))
     p.add_argument("--autostart", action="store_true", default=_flag("AUTOSTART"))
     p.add_argument("--displace-held", action="store_true", default=_flag("DISPLACE_HELD"))
-    p.add_argument("--blocked-timeout", type=float, default=float(os.environ.get("BLOCKED_TIMEOUT_S", 0) or 0))
-    p.add_argument("--loading-station", type=_point_mm, metavar="X,Y", default=os.environ.get("LOADING_STATION", ""))
-    p.add_argument("--idle-rz", type=_quarter_deg, metavar="DEG", default=os.environ.get("IDLE_RZ", ""))
-    p.add_argument("--mode", choices=("free", "line"), default=os.environ.get("MODE", "").strip().lower() or "free")
-    p.add_argument("--line-layout", metavar="FILE|URL", default=os.environ.get("LINE_LAYOUT", "").strip())
-    p.add_argument("--zones", metavar="FILE|URL", default=os.environ.get("ZONES", "").strip())
-    p.add_argument("--speed", type=float, default=float(os.environ.get("XBOT_SPEED", 0.5)))
-    p.add_argument("--accel", type=float, default=float(os.environ.get("XBOT_ACCEL", 2.0)))
-    p.add_argument("--jerk", type=float, default=float(os.environ.get("XBOT_JERK", "").strip() or 0) or None)
-    p.add_argument("--log-level", default=os.environ.get("LOG_LEVEL", "INFO"))
-    args = p.parse_args()
-    if args.mode not in ("free", "line"):  # from MODE: argparse checks only what is given on the command line
-        p.error(f"MODE is free or line, not {args.mode!r}")
-    return args
+    p.add_argument("--blocked-timeout", type=_number, metavar="S", default=_env("BLOCKED_TIMEOUT_S"))
+    p.add_argument("--loading-station", type=_point_mm, metavar="X,Y", default=_env("LOADING_STATION"))
+    p.add_argument("--idle-rz", type=_quarter_deg, metavar="DEG", default=_env("IDLE_RZ"))
+    p.add_argument("--mode", type=_mode, metavar="free|line", default=_env("MODE", "free"))
+    p.add_argument("--line-layout", metavar="FILE|URL", default=_env("LINE_LAYOUT"))
+    p.add_argument("--zones", metavar="FILE|URL", default=_env("ZONES"))
+    p.add_argument("--speed", type=_positive, metavar="M/S", default=_env("XBOT_SPEED", "0.5"))
+    p.add_argument("--accel", type=_positive, metavar="M/S2", default=_env("XBOT_ACCEL", "2.0"))
+    p.add_argument("--jerk", type=_number, metavar="M/S3", default=_env("XBOT_JERK"))
+    p.add_argument("--log-level", type=_level, default=_env("LOG_LEVEL", "INFO"))
+    return p.parse_args()
 
 
 async def detect(driver):
@@ -168,12 +211,9 @@ async def main():
         except (OSError, zones.ZoneError) as e:
             raise SystemExit(f"ZONES {args.zones}: {e}") from None
         log.info("zones: %s", ", ".join(z.name for z in zone_specs) or "none")
-    driver = PmcDriver(args.pmc_ip, speed=args.speed, accel=args.accel, jerk=args.jerk)
-    if args.shuttles.strip():
-        shuttles = [int(x) for x in args.shuttles.replace(" ", "").split(",") if x]
-    else:
-        shuttles = await detect(driver)
-    ctl = PlanarController(driver, shuttles, displace_held=args.displace_held,
+    driver = PmcDriver(args.pmc_ip, jerk=args.jerk)
+    shuttles = args.shuttles or await detect(driver)
+    ctl = PlanarController(driver, shuttles, displace_held=args.displace_held, speed=args.speed, accel=args.accel,
                            patience_s=args.blocked_timeout or None, loading_station=args.loading_station,
                            idle_rz=args.idle_rz, line_spec=line_spec,
                            line_source=(lambda: lines.load(args.line_layout)) if line_spec else None,
@@ -195,6 +235,7 @@ async def main():
                          f"set OPCUA_ENDPOINT to another port, e.g. opc.tcp://0.0.0.0:4841/") from None
     finally:
         ctl.shutdown()
+        log.info("stopped")
 
 
 def _interrupt(signum, frame):

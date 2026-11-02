@@ -1,6 +1,6 @@
 """
 Contention stress on the simulated driver: many xbots ask for the same place; each that gets
-there stays a while (held, as a station would hold it), then leaves for its own parking spot
+there stays a while (pinned, as a station would hold it), then leaves for its own parking spot
 and is released. The places are of every kind: slot centres, between slots, slot corners, flyway
 centres, turned and crooked.
 
@@ -93,7 +93,7 @@ def trial(layout, n, seed, stagger, dwell):
             return None
     h = Harness(layout, {x: (s[0], s[1], math.radians(s[2])) for x, s in starts.items()})
     for x in starts:
-        h.coord.hold(x, True)  # occupied by their orchestrators throughout
+        h.coord.pin(x, True)  # occupied by their orchestrators throughout
     order = list(starts)
     rng.shuffle(order)
     requests = []
@@ -133,7 +133,7 @@ def trial(layout, n, seed, stagger, dwell):
                 if not ok:
                     return f"xbot {x} to park failed {err!r}"
                 parked.add(x)
-                h.coord.hold(x, False)  # the product is gone: the shuttle is released
+                h.coord.pin(x, False)  # the product is gone: the shuttle is released
         if len(parked) == n:
             break
     if h.sim.collisions:

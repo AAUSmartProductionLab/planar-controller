@@ -64,7 +64,7 @@ docker compose down              # stop
 | `MODE` | `free` | `free`: the xbots may travel anywhere on the table; `line`: only on the lanes of `LINE_LAYOUT` (see [Line mode](#line-mode)) |
 | `LINE_LAYOUT` | empty | line mode: the layout, a file in `config/` (e.g. `config/line-layout.json`) or an `http(s)://` URL to fetch it from at start-up |
 | `ZONES` | empty | zones of the table to switch off for putting xbots on or taking them off, or to slow down in: a file in `config/` (see `config/zones.example.json`) or URL (see [Zones](#zones)) |
-| `XBOT_SPEED`, `XBOT_ACCEL`, `XBOT_JERK` | `0.5`, `2.0`, empty | m/s, m/s² (less for an xbot whose payload the PMC allows less with), m/s³ (empty: the PMC's) |
+| `XBOT_SPEED`, `XBOT_ACCEL`, `XBOT_JERK` | `0.5`, `2.0`, empty | m/s and m/s² every xbot moves at, or slower (see [Speed](#speed); `PlanarTable/Equipment/SetSpeed` changes them over OPC UA), and m/s³ (empty: the PMC's) |
 | `LOG_LEVEL` | `INFO` | |
 
 The container uses host networking (the PMC's auto search needs it, and the OPC UA port is this
@@ -96,12 +96,14 @@ Namespace `urn:aau:smartproductionlab:planar`. Modules: `PlanarTable` and `Plana
 | `Equipment/Xbot/X`, `Y`, `Rz`, `XbotState` | shuttles: the live pose (mm, degrees in (-180, 180]); NaN until the PMC has been read, at the first Reset. `XbotState` is the PMC's (`XBOT_IDLE`, ...), `ACCIDENT (...)` when the PMC switched it off after an accident |
 | `Equipment/Xbot/SetPayload(Session, PayloadKg, CgHeight)` | shuttles, the occupant's, not while its skill runs: tell the PMC what the xbot carries (kg, its centre of gravity mm above the xbot); see [Payload](#payload) |
 | `Equipment/Xbot/PayloadKg`, `PayloadCgHeight`, `MaxAcceleration` | shuttles: the payload as the PMC was told it or has it (read at every Reset), and the acceleration the PMC allows with it (m/s²), which its moves keep to; NaN while unknown |
+| `Equipment/Xbot/SetSpeed(Session, Speed, Acceleration)`; `Speed`, `Acceleration` | shuttles: keep the xbot slower than the table (m/s, m/s²; 0 or NaN: no limit of its own), whoever may command the shuttle; and how fast its moves are (NaN until the first Reset). See [Speed](#speed) |
 | `Equipment/PMC/Connected`, `Columns`, `Rows`, `FlywaySize`, `Holes` | the table: the PMC's connection and the layout it reports (flyways of `FlywaySize` mm in `Columns` by `Rows`, without the `Holes`, given as `"<column>,<row>"` apart by spaces; 0 and empty until connected) |
 | `Equipment/PMC/Flyways/Flyway_<c>_<r>/PowerConsumption`, `CpuTemperature`, `AmplifierTemperature`, `MotorTemperature` | the table: each flyway's power (W) and temperatures (°C), read every 5 s; added at the first Reset, NaN until read (the simulator reports 0) |
 | `Equipment/Zones/<name>/State`, `Xbots`; `Deactivate`, `Activate` `(Session)` | the table, with `ZONES`: the PMC's state of the zone and the xbots inside (ids apart by spaces); switch it off and on (see [Zones](#zones)) |
 | `Equipment/ZoneProblem` | the table: why the last Reset did not define the zones; empty when it did |
 | `Equipment/LoadingQueue` | the table: the free shuttles waiting at the loading station (and turned to `IdleRz`), the one on it first, apart by spaces (e.g. `"PlanarShuttle3 PlanarShuttle1"`): the one to occupy for the next product; empty without `LOADING_STATION` |
 | `Equipment/IdleRz` | the table, writable: the orientation in degrees free shuttles are turned to, a multiple of 90; NaN: as they are. Another value is not taken and reads back as it was. Starts as `IDLE_RZ` |
+| `Equipment/SetSpeed(Session, Speed, Acceleration)`; `Speed`, `Acceleration` | the table: how fast every xbot moves at most (m/s, m/s²; 0 or NaN: `XBOT_SPEED`, `XBOT_ACCEL` again), whoever may command the table; and what it is now. See [Speed](#speed) |
 | `Equipment/Mode`, `Equipment/LineLayout` | the table: `free` or `line`, and in line mode the layout's JSON as it was read (empty in free mode) |
 | `Equipment/LineLayoutProblem` | the table, line mode: why the last Reset did not take the line layout as it is now (it is no layout, does not fit the table, or could not be read again and the one before is used); empty when it did |
 
@@ -118,26 +120,29 @@ parameters are in range (8), then the PMC, the xbot and the target (21, 25 to 29
 
 **The modules** (PackML numbers): Stopped 2 -Reset-> Resetting 15 -> Idle 4 -Start-> Execute 6;
 Execute -Hold-> Holding 10 -> Held 11 -Unhold-> Unholding 12 -> Execute; Stop → Stopping 7 →
-Stopped; Abort → Aborted 9 -Clear-> Stopped. Hold pauses the xbots where they are, in the middle
-of a move or a turn (the table's: every xbot; a shuttle's: its own); their skills stay Running
-and nothing times out while they are held, and a skill Start is refused with NotReady (4). Unhold
-carries on with the same moves. A shuttle held on its own is unheld only while the table is in
-Execute, and the table's Unhold unholds its held shuttles too. A Stop while held lets the moves
-end first; an Abort stops them at once. The table's Resetting connects
-to the PMC, takes mastership, recovers the xbots the PMC switched off after an accident,
-levitates the xbots and, with `LOADING_STATION`, sends every shuttle
-into the loading queue with the PMC's auto routing (one command, up to 10 xbots; with more, or if
-the PMC refuses, the planner lines them up during the Resetting). The auto routing does not turn
-the xbots, so with `IdleRz` set the Resetting then turns each shuttle to it on a flyway centre
-before the table is Idle. A Stop meanwhile stops them. A shuttle's Resetting recovers its xbot if
-the PMC switched it off after an accident (and waits up to 15 s for it to levitate), and checks
-that its xbot is there.
-The table's Stop and Abort reach every shuttle, its Reset, Start, Hold, Unhold and Clear the
-shuttles in the matching state, so one Reset and one Start of the table bring everything up. Only
-the occupant may command an occupied module; Abort is taken from anyone. A lost PMC connection
-aborts the table with ErrorID 27, and another program taking mastership of the PMC (PMT, another
-controller) with 32, within a second; Clear, Reset and Start bring it back (the Reset takes
-mastership again).
+Stopped; Abort → Aborted 9 -Clear-> Stopped. Only the occupant may command an occupied module;
+Abort is taken from anyone.
+
+- The table's Stop and Abort reach every shuttle, its Reset, Start, Hold, Unhold and Clear the
+  shuttles in the matching state, so one Reset and one Start of the table bring everything up.
+- The table's Resetting connects to the PMC, takes mastership, recovers the xbots the PMC switched
+  off after an accident, levitates the xbots and, with `LOADING_STATION`, sends every shuttle into
+  the loading queue with the PMC's auto routing (one command, up to 10 xbots; with more, or if the
+  PMC refuses, the planner lines them up during the Resetting). The auto routing does not turn the
+  xbots, so with `IdleRz` set the Resetting then turns each shuttle to it on a flyway centre before
+  the table is Idle. A Stop meanwhile stops them.
+- A shuttle's Resetting recovers its xbot if the PMC switched it off after an accident (and waits
+  up to 15 s for it to levitate), and checks that its xbot is there.
+- Hold pauses the xbots where they are, in the middle of a move or a turn (the table's: every
+  xbot; a shuttle's: its own): the PMC pauses the ones moving, and none is sent anything more.
+  Their skills stay Running and nothing times out while they are held; a skill Start is refused
+  with NotReady (4), and a skill Stop takes effect once they are unheld. Unhold carries on with
+  the same moves. A shuttle held on its own is unheld only while the table is in Execute, and the
+  table's Unhold unholds its held shuttles too. A Stop while held lets the moves end first; an
+  Abort stops them at once.
+- A lost PMC connection aborts the table with ErrorID 27, and another program taking mastership
+  of the PMC (PMT, another controller) with 32, within a second; Clear, Reset and Start bring it
+  back (the Reset takes mastership again).
 
 **ErrorID.** A refused method answers `[False, ErrorID]`; a skill or procedure that fails shows
 its ErrorID in `ErrorID` next to its `State`.
@@ -167,9 +172,11 @@ its ErrorID in `ErrorID` next to its `State`.
 | 34 | ZonesInvalid | the table's Resetting found a zone of `ZONES` that is not on the table, or the PMC would not define it (`Equipment/ZoneProblem` says why) |
 
 Besides, `SetPayload` answers OutOfRange (8) for a payload the xbot does not take (the
-simulator's M3-06 takes at most 0.5 kg), Busy (6) while the xbot moves or is held; `Deactivate`
-answers Busy while an xbot is on its way into, out of or across the zone, or stands across its
-edge, and NotReady (4) when the zone is not switched on.
+simulator's M3-06 takes at most 0.5 kg), Busy (6) while the xbot moves or is held; `SetSpeed`
+answers OutOfRange for a negative speed or acceleration, and on a shuttle XbotNotDetected (28)
+before the table's first Reset; `Deactivate` answers Busy while an xbot is on its way into, out
+of or across the zone, or stands across its edge, and NotReady (4) when the zone is not switched
+on.
 
 A typical run: `PlanarTable/Module/Reset`, wait for Idle, `Start`; then per product
 `PlanarShuttle1/Occupation/Occupy(id)`, `Skills/MoveToPosition/Start(id, x, y, rz)`, wait for
@@ -185,9 +192,10 @@ State 3, ... , `Release(id)`.
 - Otherwise all xbots move as one plan (`planar/mapf.py`: LaCAM with PIBT). It finds a way
   whenever there is one, including two xbots passing each other in a one-lane passage by way of
   a pocket, and pushes idle xbots out of the way. Once it has a plan it tries more for up to
-  50 ms and takes the one estimated to be done soonest, the way it is executed: every corner and
-  every wait for another xbot costs a stop and a start, so a straight route wins over a
-  staircase and a detour that saves waiting can win over the shortest way.
+  50 ms and takes the one estimated to be done soonest, the way it is executed (each xbot at its
+  own speed): every corner and every wait for another xbot costs a stop and a start, so a
+  straight route wins over a staircase and a detour that saves waiting can win over the shortest
+  way.
 - A new plan is made as soon as anything changes (a request, an xbot taken or let go, a claim),
   without stopping the others: an xbot on its way is planned on from where its motion ends, and
   nobody enters a slot it has still to leave until it has left it.
@@ -203,7 +211,11 @@ State 3, ... , `Release(id)`.
 - Requests for the same place are served in the order they were made: a younger one waits, on a
   slot where the planner can move it aside, until the older one has arrived there and left again.
 - Plans are executed by dependencies, not by time: an xbot starts into a slot only once the xbot
-  that was there has fully left it, so a slow or late xbot cannot cause a collision.
+  that was there has fully left it, so a slow or late xbot cannot cause a collision. Nor is an
+  xbot sent into the way another is still travelling (the slots that one has left on its current
+  straight move, and one behind them) while that one has more than 0.4 s to go: Planar Motor's
+  simulator stops it there with `XBOT_OBSTACLE_DETECTED` while the move ahead has more than
+  about 0.65 s to go, though that xbot is well ahead.
 - The PMC rotates an xbot only on a flyway centre. A turn claims a whole flyway, waits until the
   others have left it, drives to its centre, turns the shortest way (by the difference from its
   angle: to an absolute angle the PMC, which does not wrap angles, would turn from -90 to 180 deg
@@ -217,14 +229,36 @@ State 3, ... , `Release(id)`.
   and leaves the same way.
 - An unoccupied xbot left off the slots steps back onto the nearest one.
 
+## Speed
+
+Every xbot moves at the table's speed and acceleration, or slower:
+
+- `PlanarTable/Equipment/SetSpeed(Session, Speed, Acceleration)` sets the table's, in m/s and
+  m/s² (`Speed` and `Acceleration` beside it read them). They start as `XBOT_SPEED` and
+  `XBOT_ACCEL`; 0 or NaN sets one back to that.
+- `PlanarShuttle<N>/Equipment/Xbot/SetSpeed(Session, Speed, Acceleration)` keeps one xbot slower,
+  e.g. while it carries an open vial: it moves at the lower of its own and the table's; 0 or NaN:
+  no limit of its own. The limits stay until they are set again (or the controller restarts),
+  through releases and Resets, so set them back to 0 when the product leaves the shuttle.
+- A payload the PMC allows less with lowers its acceleration further (see [Payload](#payload)),
+  and a zone's `speed` scales both inside the zone (see [Zones](#zones)). The shuttle's `Speed`
+  and `Acceleration` read what its moves are made with, apart from zones.
+
+Whoever may command the module sets its speed: its occupant, or anyone while it is not occupied.
+A motion under way keeps the speed it was sent with; the new one counts from the xbot's next
+motion (a long straight move goes on as it was). Turns keep their own speed. The PMC takes any
+speed but moves no xbot faster than it can go: in Planar Motor's simulator about 3 m/s, whether
+4, 6 or 10 m/s is set.
+
 ## Payload
 
 A station that puts something on a shuttle (filling, a part) tells the PMC what it now carries:
 `PlanarShuttle<N>/Equipment/Xbot/SetPayload(Session, PayloadKg, CgHeight)`, the shuttle's
 occupant, while the shuttle is not moving. The PMC tunes its control to the payload and says how
-fast the xbot may accelerate with it (`MaxAcceleration`); the xbot's moves then keep to that,
-below `XBOT_ACCEL`, so a full vial is driven more gently. The PMC keeps the payload until it is
-told another (it is read back at every Reset); set it to 0 when the product leaves the shuttle.
+fast the xbot may accelerate with it (`MaxAcceleration`); the xbot's moves then keep to that when
+it is below their acceleration (see [Speed](#speed)), so a full vial is driven more gently. The
+PMC keeps the payload until it is told another (it is read back at every Reset); set it to 0 when
+the product leaves the shuttle.
 `XBOT_JERK` limits the jerk of every xbot, smoothing their starts and stops.
 
 The PMC refuses a payload over what the xbot takes (OutOfRange, 8). Planar Motor's simulator
@@ -368,13 +402,16 @@ I>>+>>^#     #        a slot of no lane
 | `planar/lines.py` | line mode: the layout, its slot graph and who may use which slots |
 | `planar/zones.py` | the zones of `ZONES` |
 | `planar/layout.py` | the table: flyways, holes, slots, footprints, boxes |
+| `planar/driver.py` | what the coordinator needs from a PMC; a driver for another kind of table implements its `connect`, `read`, `move`, `rotate` and `stop`, the rest is optional |
 | `planar/pmc_driver.py`, `planar/sim_driver.py` | pmclib, and a kinematic stand-in for tests |
 | `planar/opcua_server.py` | the OPC UA address space |
 | `planar/__main__.py` | settings, start-up, autostart |
+| `tests/harness.py` | the table and its shuttles on the stand-in, with the tests' own clock |
 
 ```bash
 pip install -r requirements.txt dependencies/pmclib-117.9.1-py3-none-any.whl pytest
-python -m pytest tests                    # no PMC needed; about 3 minutes
+python -m pytest tests -m "not slow"      # no PMC needed; about 20 s
+python -m pytest tests                    # and the production line in real time; about 5 minutes
 python tests/stress_contention.py 40      # 480 runs: many xbots, one place, in order, no collisions
 ```
 

@@ -70,7 +70,8 @@ async def _move_over_opc_ua():
             assert [await read(*xbot, k) for k in ("X", "Y", "Rz")] == [60.0, 60.0, 0.0]
             pmc = ("PlanarTable", "Equipment", "PMC")
             assert [await read(*pmc, n) for n in ("Columns", "Rows", "FlywaySize", "Holes")] == [4, 3, 240.0, "2,1"]
-            assert [await read("PlanarTable", "Equipment", n) for n in ("Mode", "LineLayout", "LineLayoutProblem")]                 == ["free", "", ""]
+            assert [await read("PlanarTable", "Equipment", n) for n in ("Mode", "LineLayout", "LineLayoutProblem")] \
+                == ["free", "", ""]
             assert await call(table, "Start", session) == (True, ErrorID.NONE)
             assert await wait(await path("PlanarShuttle1", "Module", "State"), int(ModuleState.EXECUTE))
 
@@ -97,6 +98,16 @@ async def _move_over_opc_ua():
             assert await call(xbot_node, "SetPayload", session, mm(0.25), mm(25)) == (True, ErrorID.NONE)
             assert await wait(await path(*xbot, "PayloadKg"), 0.25)
             assert await read(*xbot, "PayloadCgHeight") == 25.0
+
+            # Speed: the table's, every xbot's; a shuttle's own keeps its xbot to less.
+            equipment = await path("PlanarTable", "Equipment")
+            other = ("PlanarShuttle2", "Equipment", "Xbot")
+            assert [await read("PlanarTable", "Equipment", k) for k in ("Speed", "Acceleration")] == [0.5, 2.0]
+            assert await call(equipment, "SetSpeed", session, mm(-1), mm(0)) == (False, ErrorID.OUT_OF_RANGE)
+            assert await call(equipment, "SetSpeed", session, mm(1.0), mm(4.0)) == (True, ErrorID.NONE)
+            assert await call(xbot_node, "SetSpeed", session, mm(0.25), mm(0)) == (True, ErrorID.NONE)
+            assert [await read(*xbot, k) for k in ("Speed", "Acceleration")] == [0.25, 4.0]
+            assert [await read(*other, k) for k in ("Speed", "Acceleration")] == [1.0, 4.0]
 
             # A zone, and the flyways (added at the Reset).
             zone = ("PlanarTable", "Equipment", "Zones", "Service")

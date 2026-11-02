@@ -108,6 +108,15 @@ def test_a_follower_waits_until_the_one_ahead_has_left():
     assert execution_time(configs, m)[0] == pytest.approx(2 * m.travel_time(m.pitch))
 
 
+def test_each_xbot_is_estimated_with_its_own_motion():
+    # Two xbots two slots along their own rows, one of them slower: the plan is done when it is.
+    configs = [((0, 0), (0, 1)), ((1, 0), (1, 1)), ((2, 0), (2, 1))]
+    fast, slow = Motion(), Motion(speed=0.2, accel=0.5)
+    done = [m.travel_time(2 * m.pitch) for m in (fast, slow)]
+    assert execution_time(configs, [fast, slow]) == pytest.approx((done[1], sum(done)))
+    assert execution_time(configs, fast) == pytest.approx((done[0], 2 * done[0]))
+
+
 def test_slots_an_xbot_in_flight_has_to_leave_hold_the_plan_back():
     # Something not in the plan is still leaving (1, 0) by its move 7.
     (move,), = actions([((0, 0),), ((1, 0),)], first_id=10, leaving={(1, 0): 7})

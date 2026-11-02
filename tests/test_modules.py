@@ -1,45 +1,12 @@
+"""The table and shuttle modules on the simulated driver, as an orchestrator uses them."""
+
 import math
 
 import pytest
 
+from harness import STRIP, Cell, c
 from planar.layout import Layout
-from planar.modules import PlanarController
-from planar.sim_driver import SimDriver
 from planar.statemachines import ErrorID, ModuleState, SkillState
-
-STRIP = Layout(cols=4, rows=1)  # 8 x 2 slots
-
-
-def c(i, j):
-    return ((i + 0.5) * 120.0, (j + 0.5) * 120.0)  # mm, as the skill takes them
-
-
-class Cell:
-    def __init__(self, xbots, layout=STRIP, **options):
-        self.t = 0.0
-        self.sim = SimDriver(layout, {xid: (x / 1000, y / 1000, 0.0) for xid, (x, y) in xbots.items()})
-        self.ctl = PlanarController(self.sim, sorted(xbots), clock=lambda: self.t, plan_timeout=0.3, **options)
-        self.table = self.ctl.table
-        self.s = self.ctl.shuttles
-
-    def run(self, seconds, until=None):
-        for _ in range(int(seconds / 0.02)):
-            self.t += 0.02
-            self.sim.advance(self.t)
-            self.ctl.coordinator.tick(self.t)
-            if until is not None and until():
-                return True
-        return until is None
-
-    def up(self):
-        assert self.table.command("Reset", "") == (True, ErrorID.NONE)
-        assert self.run(2, lambda: self.table.state == ModuleState.IDLE)
-        assert all(s.state == ModuleState.IDLE for s in self.s.values())
-        assert self.table.command("Start", "") == (True, ErrorID.NONE)
-        assert all(s.state == ModuleState.EXECUTE for s in self.s.values())
-
-    def move(self, xid, session, x, y, rz=0.0):
-        return self.s[xid].skills["MoveToPosition"].start(session, {"X": x, "Y": y, "Rz": rz})
 
 
 def test_the_gate_checks_occupation_then_module_then_busy_then_range():

@@ -8,10 +8,12 @@ The OPC UA interface, laid out like a generated module's (work.md, "A generated 
                                     State, ErrorID, Parameters/<p>, Results/<r>
   /Objects/<Module>/Equipment/<Item>  the table's PMC: Connected, the layout (Columns, Rows,
                                     FlywaySize, Holes) and Flyways/Flyway_<c>_<r> (power and
-                                    temperatures); its LoadingQueue, IdleRz (writable), Mode,
-                                    LineLayout and Zones/<name> (State, Xbots; Deactivate,
-                                    Activate); a shuttle's Xbot: X, Y, Rz, XbotState, the payload
-                                    (PayloadKg, PayloadCgHeight, MaxAcceleration; SetPayload)
+                                    temperatures); its LoadingQueue, IdleRz (writable), Speed
+                                    and Acceleration (SetSpeed), Mode, LineLayout and
+                                    Zones/<name> (State, Xbots; Deactivate, Activate); a
+                                    shuttle's Xbot: X, Y, Rz, XbotState, the payload (PayloadKg,
+                                    PayloadCgHeight, MaxAcceleration; SetPayload), Speed and
+                                    Acceleration (SetSpeed)
 
 Every method answers [Accepted, ErrorID] at once. A MoveToPosition that was accepted finishes
 when the xbot has arrived: its State turns Succeeded (3), or Failed (4) with an ErrorID.
@@ -27,6 +29,8 @@ import logging
 import math
 
 from asyncua import Server, ua
+
+from .statemachines import ErrorID
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +52,14 @@ ANSWER = [
     _argument("Accepted", ua.ObjectIds.Boolean, "Whether the command was taken"),
     _argument("ErrorID", ua.ObjectIds.Int32, "Why not: 4 NotReady, 5 NotPermitted, 6 Busy, 8 OutOfRange, ..."),
 ]
+
+
+def _set_speed(ctl, xid):
+    """SetSpeed(Session, Speed, Acceleration) of xbot xid, or of the table (None); empty is 0."""
+    defaults = ("XBOT_SPEED", "XBOT_ACCEL") if xid is None else ("the table's", "the table's")
+    inputs = [SESSION, _argument("Speed", ua.ObjectIds.Double, f"m/s; 0 or NaN: {defaults[0]}"),
+              _argument("Acceleration", ua.ObjectIds.Double, f"m/s^2; 0 or NaN: {defaults[1]}")]
+    return lambda s, speed, accel: ctl.set_speed(xid, s, float(speed or 0.0), float(accel or 0.0)), inputs
 
 
 class OpcUaServer:
@@ -169,9 +181,15 @@ class OpcUaServer:
 
         def set_idle_rz(deg):
             error = self.ctl.coordinator.set_idle_rz(math.radians(deg))
-            log.info("IdleRz %s: %s", deg, "set" if error == 0 else "refused (a multiple of 90 or NaN)")
+            log.info("IdleRz %s: %s", deg, "set" if error == ErrorID.NONE else "refused (a multiple of 90 or NaN)")
 
         await self._variable(parent, "IdleRz", idle_rz, ua.VariantType.Double, write=set_idle_rz)
+
+        # How fast every xbot moves at most (m/s, m/s^2): XBOT_SPEED and XBOT_ACCEL until SetSpeed
+        # sets others; a shuttle's own SetSpeed or its payload may keep its xbot slower.
+        await self._variable(parent, "Speed", lambda: float(self.ctl.coordinator.speed), ua.VariantType.Double)
+        await self._variable(parent, "Acceleration", lambda: float(self.ctl.coordinator.accel), ua.VariantType.Double)
+        await self._method(parent, "SetSpeed", *_set_speed(self.ctl, None))
 
         # free or line (MODE); in line mode the layout's JSON as it was read (LINE_LAYOUT, read
         # again at every Reset), and why the last Reset did not take it as it is now (empty: it did).
@@ -231,24 +249,33 @@ class OpcUaServer:
         await self._variable(xbot, "Rz", lambda: float(reading(2)), ua.VariantType.Double)
         await self._variable(xbot, "XbotState", lambda: str(reading(3)), ua.VariantType.String)
 
-        # The payload as the PMC was told it (kg, its centre of gravity mm above the xbot) and the
-        # acceleration the PMC allows with it (m/s^2; its moves keep to it): NaN while unknown.
-        # SetPayload is the occupant's, while the shuttle's skill does not run.
-        def payload(read):
+        def of_agent(read):  # read(the xbot's agent); NaN while there is none (or it says None)
             def value():
                 agent = self.ctl.coordinator.agents.get(xid)
                 v = read(agent) if agent is not None else None
                 return math.nan if v is None else float(v)
             return value
 
-        await self._variable(xbot, "PayloadKg", payload(lambda a: a.payload and a.payload[0]), ua.VariantType.Double)
-        await self._variable(xbot, "PayloadCgHeight", payload(lambda a: a.payload and a.payload[1] * 1000.0),
+        # The payload as the PMC was told it (kg, its centre of gravity mm above the xbot) and the
+        # acceleration the PMC allows with it (m/s^2; its moves keep to it): NaN while unknown.
+        # SetPayload is the occupant's, while the shuttle's skill does not run.
+        await self._variable(xbot, "PayloadKg", of_agent(lambda a: a.payload and a.payload[0]),
                              ua.VariantType.Double)
-        await self._variable(xbot, "MaxAcceleration", payload(lambda a: a.max_accel), ua.VariantType.Double)
+        await self._variable(xbot, "PayloadCgHeight", of_agent(lambda a: a.payload and a.payload[1] * 1000.0),
+                             ua.VariantType.Double)
+        await self._variable(xbot, "MaxAcceleration", of_agent(lambda a: a.max_accel), ua.VariantType.Double)
         await self._method(xbot, "SetPayload",
                            lambda s, kg, cg: self.ctl.set_payload(xid, s, float(kg or 0.0), float(cg or 0.0)),
                            [SESSION, _argument("PayloadKg", ua.ObjectIds.Double, "kg"),
                             _argument("CgHeight", ua.ObjectIds.Double, "mm above the xbot")])
+
+        # How fast its moves are (m/s, m/s^2): the table's, or less as SetSpeed (whoever may
+        # command the shuttle) and its payload keep it to; NaN until the first Reset.
+        coordinator = self.ctl.coordinator
+        await self._variable(xbot, "Speed", of_agent(lambda a: coordinator.speed_of(a)[0]), ua.VariantType.Double)
+        await self._variable(xbot, "Acceleration", of_agent(lambda a: coordinator.speed_of(a)[1]),
+                             ua.VariantType.Double)
+        await self._method(xbot, "SetSpeed", *_set_speed(self.ctl, xid))
 
     async def _method(self, parent, name, fn, inputs):
         async def handler(_parent, *args):
@@ -257,7 +284,7 @@ class OpcUaServer:
                 accepted, error = await asyncio.to_thread(fn, *values)
             except Exception:
                 log.exception("%s", name)
-                accepted, error = False, 4
+                accepted, error = False, ErrorID.NOT_READY
             await self._refresh()
             return [ua.Variant(bool(accepted), ua.VariantType.Boolean), ua.Variant(int(error), ua.VariantType.Int32)]
 
