@@ -15,3 +15,6 @@ venv/
 
 # Planar Motor's simulation tool, if copied here for tools/pmc-sim.ps1: not to be shared
 /pmc-sim/
+
+# The documentation site, as mkdocs build makes it
+/mkdocs/site/

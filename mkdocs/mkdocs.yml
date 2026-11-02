@@ -1,0 +1,61 @@
+# The planar controller's documentation, built with MkDocs (https://www.mkdocs.org):
+#
+#   pip install -r mkdocs/requirements.txt
+#   mkdocs serve -f mkdocs/mkdocs.yml     # http://127.0.0.1:8000, rebuilt as the pages change
+#   mkdocs build -f mkdocs/mkdocs.yml     # the site, in mkdocs/site/ (git ignores it)
+#
+# Read the Docs builds it from a .readthedocs.yaml at the repository's root:
+#
+#   version: 2
+#   build:
+#     os: ubuntu-24.04
+#     tools:
+#       python: "3.12"
+#   mkdocs:
+#     configuration: mkdocs/mkdocs.yml
+#   python:
+#     install:
+#       - requirements: mkdocs/requirements.txt
+
+site_name: Planar controller
+site_description: Controls a Planar Motor table and offers it over OPC UA; every xbot moves as part of one plan.
+repo_url: https://github.com/AAUSmartProductionLab/planar-controller
+repo_name: planar-controller
+edit_uri: edit/main/mkdocs/docs/
+copyright: Copyright &copy; 2026 Aalborg University Smart Lab. MIT License.
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - search.highlight
+
+nav:
+  - Home: index.md
+  - Using it:
+      - Getting started: getting-started.md
+      - Configuration: configuration.md
+      - OPC UA interface: opcua-interface.md
+      - Examples: examples.md
+  - How it works:
+      - The planner: planner.md
+      - Line mode: line-mode.md
+      - Speed and payload: speed-and-payload.md
+      - Zones: zones.md
+  - Developing it:
+      - Architecture: architecture.md
+      - Testing: testing.md
+  - Troubleshooting: troubleshooting.md
+
+validation:
+  links:
+    anchors: warn  # a link to a heading that is not there; mkdocs build --strict fails on it
+
+markdown_extensions:
+  - toc:
+      permalink: true
+  - tables
+  - pymdownx.highlight
+  - pymdownx.superfences

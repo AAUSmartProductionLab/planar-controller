@@ -6,6 +6,14 @@ manager and skills. An orchestrator occupies a shuttle, runs its `MoveToPosition
 as it likes, and releases it. All xbots on the table move as one plan, so they get past each
 other in narrow passages, and requests for the same place are served in the order they were made.
 
+The documentation is in [`mkdocs/docs/`](mkdocs/docs/index.md), for a MkDocs or Read the Docs site:
+[getting started](mkdocs/docs/getting-started.md), [configuration](mkdocs/docs/configuration.md),
+[the OPC UA interface](mkdocs/docs/opcua-interface.md), [examples](mkdocs/docs/examples.md),
+[the planner](mkdocs/docs/planner.md), [line mode](mkdocs/docs/line-mode.md),
+[speed and payload](mkdocs/docs/speed-and-payload.md), [zones](mkdocs/docs/zones.md),
+[architecture](mkdocs/docs/architecture.md), [testing](mkdocs/docs/testing.md) and
+[troubleshooting](mkdocs/docs/troubleshooting.md). This README is the short reference.
+
 ## Install
 
 On a Linux machine that can reach the PMC (it installs Docker if it is missing, builds the image
@@ -72,7 +80,7 @@ machine's). Docker Desktop on Windows and macOS needs host networking switched o
 in `docker-compose.yml` for the alternative. The image is healthy while its OPC UA server takes
 connections.
 
-Without Docker (Python 3.11, and mono on Linux for pmclib):
+Without Docker (Python 3.11 or later, and mono on Linux for pmclib):
 
 ```bash
 pip install -r requirements.txt dependencies/pmclib-117.9.1-py3-none-any.whl
@@ -81,6 +89,57 @@ PMC_IP=127.0.0.1 AUTOSTART=1 python -m planar     # see --help
 
 On a Windows PC with OPC UA tools installed, port 4840 is often taken by the OPC UA Local
 Discovery Server and 4841 by UaExpert: set `OPCUA_ENDPOINT=opc.tcp://127.0.0.1:4850/`.
+
+## A first move
+
+With [asyncua](https://github.com/FreeOpcUa/opcua-asyncio): bring the table up, occupy a
+shuttle, move it, release it. Each call answers `[True, 0]` when it is accepted.
+
+```python
+import asyncio
+import uuid
+
+from asyncua import Client, ua
+
+
+async def main():
+    async with Client("opc.tcp://127.0.0.1:4840/") as client:
+        ns = await client.get_namespace_index("urn:aau:smartproductionlab:planar")
+
+        async def node(*path):
+            return await client.nodes.objects.get_child([f"{ns}:{name}" for name in path])
+
+        async def wait(path, values):
+            while (value := await (await node(*path)).read_value()) not in values:
+                await asyncio.sleep(0.05)
+            return value
+
+        def text(value):
+            return ua.Variant(value, ua.VariantType.String)
+
+        def number(value):
+            return ua.Variant(float(value), ua.VariantType.Double)
+
+        table = await node("PlanarTable", "Module")
+        print("Reset:", await table.call_method(f"{ns}:Reset", text("")))  # nobody occupies the table
+        await wait(("PlanarTable", "Module", "State"), (4,))                # Idle
+        print("Start:", await table.call_method(f"{ns}:Start", text("")))
+        await wait(("PlanarTable", "Module", "State"), (6,))                # Execute
+
+        session = str(uuid.uuid4())
+        occupation = await node("PlanarShuttle1", "Occupation")
+        print("Occupy:", await occupation.call_method(f"{ns}:Occupy", text(session)))
+        skill = await node("PlanarShuttle1", "Skills", "MoveToPosition")
+        print("Start:", await skill.call_method(f"{ns}:Start", text(session), number(780), number(660), number(90)))
+        print("State:", await wait(("PlanarShuttle1", "Skills", "MoveToPosition", "State"), (3, 4)))  # 3: arrived
+        print("Release:", await occupation.call_method(f"{ns}:Release", text(session)))
+
+
+asyncio.run(main())
+```
+
+More in [the examples](mkdocs/docs/examples.md): the loading queue, a product agent, payload and
+speed, Hold, Stop and Abort, recovering after a fault, zones, subscriptions.
 
 ## Modules and their OPC UA interface
 
@@ -93,7 +152,7 @@ Namespace `urn:aau:smartproductionlab:planar`. Modules: `PlanarTable` and `Plana
 | `Module/Reset`, `Start`, `Hold`, `Unhold`, `Stop`, `Abort`, `Clear` `(Session)`; `State`, `ErrorID` | |
 | `Skills/MoveToPosition/Start(Session, X, Y, Rz)`, `Stop`, `Abort`, `Reset` `(Session)` | shuttles only; mm and degrees |
 | `Skills/MoveToPosition/State`, `ErrorID`, `Parameters/X,Y,Rz`, `Results/X,Y,Rz` | results: where it ended |
-| `Equipment/Xbot/X`, `Y`, `Rz`, `XbotState` | shuttles: the live pose (mm, degrees in (-180, 180]); NaN until the PMC has been read, at the first Reset. `XbotState` is the PMC's (`XBOT_IDLE`, ...), `ACCIDENT (...)` when the PMC switched it off after an accident |
+| `Equipment/Xbot/X`, `Y`, `Rz`, `XbotState` | shuttles: the live pose (mm, degrees in (-180, 180]); NaN until the PMC has been read, at the first Reset. `XbotState` is the PMC's (`XBOT_IDLE`, ...), `ACCIDENT (...)` when the PMC switched it off after an accident; `UNKNOWN` until the first Reset |
 | `Equipment/Xbot/SetPayload(Session, PayloadKg, CgHeight)` | shuttles, the occupant's, not while its skill runs: tell the PMC what the xbot carries (kg, its centre of gravity mm above the xbot); see [Payload](#payload) |
 | `Equipment/Xbot/PayloadKg`, `PayloadCgHeight`, `MaxAcceleration` | shuttles: the payload as the PMC was told it or has it (read at every Reset), and the acceleration the PMC allows with it (m/s²), which its moves keep to; NaN while unknown |
 | `Equipment/Xbot/SetSpeed(Session, Speed, Acceleration)`; `Speed`, `Acceleration` | shuttles: keep the xbot slower than the table (m/s, m/s²; 0 or NaN: no limit of its own), whoever may command the shuttle; and how fast its moves are (NaN until the first Reset). See [Speed](#speed) |
@@ -113,10 +172,12 @@ cannot get there.
 
 **The skill** (as SKILL_Core): Idle 0, Running 1, Stopping 2, Succeeded 3, Failed 4, Aborted 5.
 Start from Idle, Succeeded or Failed; Succeeded returns to Idle after 1.5 s; Stop → Stopping →
-Failed with Interrupted (the xbot finishes the slot it is crossing); Abort → Aborted at once (the
+Failed with Interrupted (the xbot ends the motion it is on, a straight run that may cross several
+slots, and stays there); Abort → Aborted at once (the
 xbot stops where it is); Reset only from Aborted. The gate, in order: the caller holds the
 occupation (5), the shuttle and the table are in Execute (4), the skill is not running (6), the
-parameters are in range (8), then the PMC, the xbot and the target (21, 25 to 29 below).
+parameters are in range (8), then the PMC, the xbot and the target (6, 21, 25 to 29 and 33
+below).
 
 **The modules** (PackML numbers): Stopped 2 -Reset-> Resetting 15 -> Idle 4 -Start-> Execute 6;
 Execute -Hold-> Holding 10 -> Held 11 -Unhold-> Unholding 12 -> Execute; Stop → Stopping 7 →
@@ -177,6 +238,12 @@ answers OutOfRange for a negative speed or acceleration, and on a shuttle XbotNo
 before the table's first Reset; `Deactivate` answers Busy while an xbot is on its way into, out
 of or across the zone, or stands across its edge, and NotReady (4) when the zone is not switched
 on.
+
+**After a failure.** When a move fails because of its xbot (21, 22, 23, 28, 29, 30), the PMC
+stops the xbot and the shuttle refuses every Start with that ErrorID until it is Stopped, Reset
+and Started again; its Resetting checks the xbot afresh. The occupant keeps the shuttle
+throughout, and meanwhile the others go around the xbot. Blocked (20) and Interrupted (7) leave
+the xbot fit for the next Start.
 
 A typical run: `PlanarTable/Module/Reset`, wait for Idle, `Start`; then per product
 `PlanarShuttle1/Occupation/Occupy(id)`, `Skills/MoveToPosition/Start(id, x, y, rz)`, wait for
@@ -248,7 +315,8 @@ Whoever may command the module sets its speed: its occupant, or anyone while it 
 A motion under way keeps the speed it was sent with; the new one counts from the xbot's next
 motion (a long straight move goes on as it was). Turns keep their own speed. The PMC takes any
 speed but moves no xbot faster than it can go: in Planar Motor's simulator about 3 m/s, whether
-4, 6 or 10 m/s is set.
+4, 6 or 10 m/s is set. `XBOT_JERK` limits the jerk of every xbot, smoothing their starts and
+stops.
 
 ## Payload
 
@@ -259,7 +327,6 @@ fast the xbot may accelerate with it (`MaxAcceleration`); the xbot's moves then 
 it is below their acceleration (see [Speed](#speed)), so a full vial is driven more gently. The
 PMC keeps the payload until it is told another (it is read back at every Reset); set it to 0 when
 the product leaves the shuttle.
-`XBOT_JERK` limits the jerk of every xbot, smoothing their starts and stops.
 
 The PMC refuses a payload over what the xbot takes (OutOfRange, 8). Planar Motor's simulator
 takes the payload but does not keep it: it reads back 0 kg and `MaxAcceleration` 20 m/s² whatever
@@ -391,6 +458,23 @@ I>>+>>^#     #        a slot of no lane
   controller does, keeps them in the line's AAS as that `PlanarRouting` collection and shows the
   `LINE_LAYOUT` URL to set.
 
+## Known limitations
+
+- **The PMC's obstacle check**: the PMC stops an xbot sent into the way another is still
+  travelling, with `XBOT_OBSTACLE_DETECTED`, by a rule Planar Motor does not publish. The
+  controller keeps out of a moving xbot's trail as measured on the simulator, which makes such
+  stops rare but not impossible; a stopped move fails with XbotFault (21) (see *After a
+  failure* above).
+- The controller assumes 120 mm xbots on 240 mm flyways. Xbots travel square to the axes, and
+  turn on flyway centres and where four flyways meet.
+- One controller per PMC: the PMC has one master. The OPC UA server has no security (policy
+  None): keep it on a trusted network.
+- In line mode, the table's Reset lines the shuttles up with the PMC's auto routing, which knows
+  nothing of the lanes.
+- pmclib cannot delete a zone: one removed from `ZONES` stays defined on the PMC until the PMC
+  restarts. An xbot put on the table through a zone is offered as a shuttle only once the
+  controller restarts.
+
 ## Development
 
 | | |
@@ -410,7 +494,7 @@ I>>+>>^#     #        a slot of no lane
 
 ```bash
 pip install -r requirements.txt dependencies/pmclib-117.9.1-py3-none-any.whl pytest
-python -m pytest tests -m "not slow"      # no PMC needed; about 20 s
+python -m pytest tests -m "not slow"      # no PMC needed; about half a minute
 python -m pytest tests                    # and the production line in real time; about 5 minutes
 python tests/stress_contention.py 40      # 480 runs: many xbots, one place, in order, no collisions
 ```
@@ -435,13 +519,18 @@ runs its PMC (`Dlls\VirtualPMC.exe`) without the tool's window, for `PMC_IP=127.
 not commercially available and not in this repository; the script runs it from where it is
 installed (or `PMC_SIM_DIR`, or a copy in `pmc-sim/`, which git and Docker ignore). While the
 tool's window is open, an engine started by the script may take no connections: start the
-simulation from the window then.
-`python tools/sim_check.py [--start-sim] [--hold-every S] [--mastership]` then runs every layout of
-`config/layouts/` against it, each with its own controller and the product agents, a PASS or FAIL
-line per layout; `--mastership` then takes mastership from another session, and the table must
-abort with MastershipLost (32) and take it back at a Reset. The
-controller's own simulation does not turn xbots as the PMC does (it turned one three quarters
-round, unseen in the simulation), so run it after changing how xbots move.
+simulation from the window then. `tools/sim_check.py` runs every layout of `config/layouts/`
+against it, each with its own controller and the product agents, and prints a PASS or FAIL line
+per layout:
+
+```bash
+python tools/sim_check.py [--start-sim] [--hold-every S] [--mastership]
+```
+
+`--mastership` then takes mastership from another session: the table must abort with
+MastershipLost (32) and take it back at a Reset. The controller's own simulation does not turn
+xbots as the PMC does (it once turned one three quarters round, unseen in the simulation), so run
+`sim_check.py` after changing how xbots move.
 
 **Disconnect from the PMC.** Every program that connects with pmclib must call
 `disconnect_from_pmc()` before it ends. For each connection left open, the simulator writes an
@@ -453,3 +542,15 @@ Ctrl+Break; one that is killed does not disconnect.
 pmclib is Planar Motor's and not on PyPI; the wheel is in `dependencies/`. 117.9.1 works with PMC
 firmware 117.17.35 and later. 117.15.01 (May 2026) needs firmware 117.26.45 and adds nothing this
 controller uses (zone and sector activation options, failed flyway recovery, xbot weighing).
+
+The documentation in `mkdocs/` builds with MkDocs:
+
+```bash
+pip install -r mkdocs/requirements.txt
+mkdocs serve -f mkdocs/mkdocs.yml        # http://127.0.0.1:8000; mkdocs build -f mkdocs/mkdocs.yml for the site
+```
+
+## License
+
+MIT License, Copyright (c) 2026 Aalborg University Smart Lab: see [LICENSE](LICENSE). pmclib, in
+`dependencies/`, is Planar Motor's.
