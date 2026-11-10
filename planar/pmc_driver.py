@@ -1,15 +1,7 @@
-"""
-The coordinator's driver for a real PMC (or the Planar Motor simulation tool), through pmclib.
-
-pmclib is a thin layer over one shared .NET session with no synchronisation of its own, so every
-call goes through one lock (_pmc(), which also turns what pmclib raises into a DriverError).
-
-The session is closed (close()) when the controller stops: the simulator, at least, otherwise
-keeps reading the dead connection and writes an error to its trace log (PMTraceLog.txt) for
-every read, gigabytes an hour, until it takes no new connections.
-"""
+"""Drive a physical or simulated PMC through the serialized pmclib .NET session."""
 
 import logging
+import math
 import os
 import tempfile
 import threading
@@ -52,8 +44,57 @@ _READY_PMC = {pm.PMCSTATUS.PMC_FULLCTRL, pm.PMCSTATUS.PMC_INTELLIGENTCTRL}
 
 
 class PmcDriver(Driver):
+    """Implement the driver contract using pmclib, with one lock around the shared session."""
+    supports_blended_moves = True
+
+    def move_blended(self, xid, path, speed, accel):
+        """Preload a line/arc/line batch while blocked, then release it ending at rest."""
+        with self._pmc():
+            xid = int(xid)
+            info = next((i for i in self._all() if int(i.xbot_id) == xid), None)
+            if (info is None or info.xbot_state != pm.XBOTSTATE.XBOT_IDLE
+                    or math.dist((float(info.x_pos), float(info.y_pos)), path.start) > 0.0005):
+                raise DriverError('blended move must start idle at its planned start')
+            speed = float(speed)
+            arc_speed = min(speed, math.sqrt(float(accel)*path.radius))
+            accel = float(accel)
+            entry, exit_ = path.tangents
+            u, v = path.directions
+            direction = (pm.ARCDIRECTION.COUNTERCLOCKWISE if u[0]*v[1]-u[1]*v[0] > 0
+                         else pm.ARCDIRECTION.CLOCKWISE)
+
+            def line(target, end_speed):
+                """Queue one absolute straight segment with the requested ending speed."""
+                return float(xbot_cmd.linear_motion_si(
+                    self._next_label(), xid, pm.POSITIONMODE.ABSOLUTE, pm.LINEARPATHTYPE.DIRECT,
+                    float(target[0]), float(target[1]), end_speed, speed, accel, 0.0))
+
+            try:
+                status = xbot_cmd.motion_buffer_control(xid, pm.MOTIONBUFFEROPTIONS.BLOCKBUFFER)
+                if not status.is_buffer_blocked or status.buffered_motion_count:
+                    raise DriverError('blended move requires an empty, blocked motion buffer')
+                expected = line(entry, arc_speed)
+                expected += float(xbot_cmd.arc_motion_meters_radians(
+                    self._next_label(), xid, pm.ARCMODE.TARGETRADIUS, pm.ARCTYPE.MINORARC,
+                    direction, pm.POSITIONMODE.ABSOLUTE, float(exit_[0]), float(exit_[1]),
+                    arc_speed, arc_speed, accel, float(path.radius), 0.0))
+                expected += line(path.end, 0.0)
+                xbot_cmd.motion_buffer_control(xid, pm.MOTIONBUFFEROPTIONS.RELEASEBUFFER)
+                return expected
+            except BaseException:
+                # Never release an incomplete nonzero-ending-speed batch. Stop clears
+                # queued commands too. If it fails, keep the buffer blocked for recovery.
+                try:
+                    xbot_cmd.stop_motion(xid)
+                    xbot_cmd.motion_buffer_control(xid, pm.MOTIONBUFFEROPTIONS.CLEARBUFFER)
+                    xbot_cmd.motion_buffer_control(xid, pm.MOTIONBUFFEROPTIONS.RELEASEBUFFER)
+                except Exception:
+                    log.exception('xbot %d: failed to clean up blended motion buffer', xid)
+                raise
+
     def __init__(self, ip=None, *, turn_speed=3.0, turn_accel=10.0, jerk=None, activate_timeout_s=30.0,
                  config_path=None):
+        """Configure the connection, rotation limits, jerk and activation timeout without connecting."""
         self.ip = ip
         self.turn_speed, self.turn_accel = turn_speed, turn_accel
         self.jerk = jerk  # m/s^3, the PMC's X limit (for X and Y), set on every xbot at connect; None: the PMC's
@@ -69,8 +110,9 @@ class PmcDriver(Driver):
 
     @contextmanager
     def _pmc(self, code=ErrorID.PMC_ERROR):
-        """One call to pmclib at a time; what it raises becomes a DriverError with this code
-        (OutOfRange for a parameter the PMC refuses, e.g. a payload over what the xbot takes)."""
+        """Serialize pmclib calls and convert exceptions to DriverError, mapping invalid parameters to
+        OUT_OF_RANGE.
+        """
         with self._lock:
             try:
                 yield
@@ -82,10 +124,12 @@ class PmcDriver(Driver):
                 raise DriverError(str(e), code) from e
 
     def _next_label(self):
+        """Allocate a nonzero 16-bit command label, wrapping after 65535."""
         self._label = self._label % 65535 + 1
         return self._label
 
     def connect(self):
+        """Acquire mastership, initialize xbots and motion settings, and return the PMC layout."""
         with self._pmc():
             self._ensure_connected()
             try:
@@ -121,6 +165,9 @@ class PmcDriver(Driver):
             return parse_pmc_config(self.config_path)
 
     def close(self):
+        """Disconnect the shared session; explicit cleanup avoids stale simulator connections and runaway
+        trace logs.
+        """
         with self._pmc():
             if not self._connected:
                 return
@@ -129,8 +176,7 @@ class PmcDriver(Driver):
         log.info("disconnected from the PMC")
 
     def _ensure_connected(self):
-        """Keep a live connection: the PMC (the simulator at least) refuses one made again at once
-        after a disconnect from the same process."""
+        """Reuse a live session or connect to the configured PMC; raise if unavailable."""
         if self._connected and sys_cmd.check_tcp_connection():
             return
         ok = sys_cmd.connect_to_specific_pmc(self.ip) if self.ip else sys_cmd.auto_search_and_connect_to_pmc()
@@ -140,6 +186,7 @@ class PmcDriver(Driver):
         self._connected = True
 
     def _wait_levitated(self, deadline):
+        """Request levitation outside closed zones until ready or the activation deadline passes."""
         ids = self._ids()
         for zid in self._zone_ids:  # not the ones in a zone switched off: they stay off
             status = sys_cmd.get_zone_status(zid)
@@ -158,10 +205,12 @@ class PmcDriver(Driver):
             time.sleep(0.5)
 
     def _ids(self):
+        """Return currently detected xbot IDs."""
         rtn = xbot_cmd.get_xbot_ids()
         return list(rtn.xbot_ids_array)[:rtn.xbot_count]
 
     def _all(self):
+        """Read the complete xbot feedback array from the shared session."""
         return xbot_cmd.get_all_xbot_info(pm.ALLXBOTSFEEDBACKOPTION(0))
 
     def detect(self):
@@ -171,6 +220,7 @@ class PmcDriver(Driver):
             return self._ids()
 
     def read(self):
+        """Return normalized xbot readings, checking mastership and annotating accident states."""
         with self._pmc(ErrorID.PMC_NOT_CONNECTED):
             infos = self._all()
             now = time.monotonic()
@@ -203,15 +253,14 @@ class PmcDriver(Driver):
         return out
 
     def move(self, xid, x, y, speed, accel):
+        """Send an absolute straight XY move ending at rest; return its expected duration."""
         with self._pmc():
             return float(xbot_cmd.linear_motion_si(
                 self._next_label(), int(xid), pm.POSITIONMODE.ABSOLUTE, pm.LINEARPATHTYPE.DIRECT,
                 float(x), float(y), 0.0, float(speed), float(accel), 0.0))
 
     def rotate(self, xid, rz):
-        """Turn by the difference from where the xbot is, the shortest way. To an absolute angle
-        the PMC turns straight from its own angle, unwrapped: from -90 deg to 180 deg it turns
-        +270 deg, the long way."""
+        """Turn by the shortest relative angular difference, avoiding the PMC's unwrapped absolute angles."""
         with self._pmc():
             now = next(float(i.rz_pos) for i in self._all() if int(i.xbot_id) == int(xid))
             return float(xbot_cmd.rotary_motion_p2p(
@@ -219,6 +268,7 @@ class PmcDriver(Driver):
                 float(self.turn_speed), float(self.turn_accel), pm.POSITIONMODE.RELATIVE))
 
     def stop(self, xid=0):
+        """Stop one xbot, or all for xid=0, and clear its queued motion commands."""
         with self._pmc():
             xbot_cmd.stop_motion(int(xid))
 
@@ -233,20 +283,24 @@ class PmcDriver(Driver):
                 targets_y_meters=[float(t[1]) for t in targets])
 
     def pause(self, xid):
+        """Pause an xbot's active motion without discarding it."""
         with self._pmc():
             xbot_cmd.motion_interrupt_command(int(xid), pm.MOTIONINTERRUPTOPTIONS.PAUSE)
 
     def resume(self, xid):
+        """Resume the xbot's paused motion."""
         with self._pmc():
             xbot_cmd.motion_interrupt_command(int(xid), pm.MOTIONINTERRUPTOPTIONS.RESUME)
 
     def payload(self, xid):
+        """Return payload kg, centre-of-gravity height m and maximum acceleration in m/s^2."""
         with self._pmc():
             settings = xbot_cmd.read_xbot_payload_settings(int(xid))
             max_accel = self._read_max_accel(xid)
         return float(settings.payloadkg), float(settings.payload_cg_heightm), max_accel
 
     def _read_max_accel(self, xid):
+        """Read the mover's allowed acceleration using pmclib's integer property ID."""
         prop = pm.MOVERPROPERTY.MAXACCELERATION_7
         rtn = xbot_cmd.get_mover_properties(int(xid), int(prop))  # an int: pmclib takes none of its IntEnums
         values = [p.property_value for p in rtn.mover_properties[:rtn.valid_properties_count]
@@ -254,7 +308,9 @@ class PmcDriver(Driver):
         return float(values[0]) if values and values[0] > 0 else None
 
     def set_payload(self, xid, kg, cg_height):
-        """The payload's size is left as the PMC has it (at least the xbot's own)."""
+        """Set payload kg and centre-of-gravity height m, preserve dimensions and return the acceleration
+        limit.
+        """
         with self._pmc():
             now = xbot_cmd.read_xbot_payload_settings(int(xid))
             xbot_cmd.write_xbot_payload_settings(int(xid), pm.XBotPayloadSettings(
@@ -262,6 +318,7 @@ class PmcDriver(Driver):
             return self._read_max_accel(xid)
 
     def recover(self, xids):
+        """Recover requested accident-disabled xbots and return the IDs recovered."""
         with self._pmc():
             rtn = xbot_cmd.get_all_accident_xbots()
             accidents = set(rtn.xbot_ids_array[:rtn.xbot_count]) & {int(x) for x in xids}
@@ -271,21 +328,25 @@ class PmcDriver(Driver):
             return sorted(accidents)
 
     def define_zone(self, zid, box, speed):
+        """Define a zone rectangle and apply its speed and acceleration scaling."""
         with self._pmc(ErrorID.ZONES_INVALID):
             sys_cmd.define_zone(int(zid), *(float(v) for v in box))
             sys_cmd.override_zone(int(zid), float(speed), float(speed))
             self._zone_ids.add(int(zid))
 
     def zone_status(self, zid):
+        """Return the zone's state name and contained xbot IDs."""
         with self._pmc():
             status = sys_cmd.get_zone_status(int(zid))
         return status.zone_state.name, [int(x) for x in status.xbot_ids[:status.xbot_count]]
 
     def zone_control(self, zid, operation):
+        """Apply the named zone operation through the PMC command mapping."""
         with self._pmc():
             _ZONE_OPERATIONS[operation](int(zid))
 
     def flyways(self):
+        """Read each flyway's power and temperatures, locking one vendor call at a time."""
         out = {}
         for flyway, fid in sorted(self._flyway_ids.items()):
             with self._pmc():  # one at a time, so the moves go on between them

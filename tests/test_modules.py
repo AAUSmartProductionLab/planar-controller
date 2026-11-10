@@ -10,6 +10,7 @@ from planar.statemachines import ErrorID, ModuleState, SkillState
 
 
 def test_the_gate_checks_occupation_then_module_then_busy_then_range():
+    """Verify skill gates check ownership, module readiness, activity and ranges in order."""
     cell = Cell({1: c(0, 0)})
     skill = cell.s[1].skills["MoveToPosition"]
     assert cell.move(1, "A", *c(3, 0)) == (False, ErrorID.NOT_PERMITTED)
@@ -31,6 +32,7 @@ def test_the_gate_checks_occupation_then_module_then_busy_then_range():
 
 
 def test_stop_interrupts_and_abort_needs_a_reset():
+    """Verify Stop reports interruption and Abort requires Reset."""
     cell = Cell({1: c(0, 0)})
     cell.up()
     cell.s[1].occupation.occupy("A")
@@ -53,6 +55,7 @@ def test_stop_interrupts_and_abort_needs_a_reset():
 
 
 def test_table_commands_reach_every_shuttle():
+    """Verify table lifecycle commands propagate to shuttle modules."""
     cell = Cell({1: c(0, 0), 2: c(7, 1)})
     cell.up()
     cell.s[1].occupation.occupy("A")
@@ -74,6 +77,7 @@ def test_table_commands_reach_every_shuttle():
 
 
 def test_only_the_occupant_commands_an_occupied_module_but_anyone_aborts():
+    """Verify occupation gates commands while module Abort remains available to anyone."""
     cell = Cell({1: c(0, 0)})
     cell.up()
     shuttle = cell.s[1]
@@ -90,6 +94,7 @@ def test_only_the_occupant_commands_an_occupied_module_but_anyone_aborts():
 
 
 def test_an_occupied_idle_xbot_is_not_pushed_a_free_one_is():
+    """Verify occupied idle xbots stay pinned while free ones may move aside."""
     # xbot 2 sits in the way in the lower lane; the upper lane is blocked at i=3 by xbot 3.
     cell = Cell({1: c(0, 0), 2: c(4, 0), 3: c(3, 1)})
     cell.up()
@@ -110,6 +115,7 @@ def test_an_occupied_idle_xbot_is_not_pushed_a_free_one_is():
 
 
 def test_reset_routes_the_shuttles_into_the_loading_queue():
+    """Verify Reset places shuttles in the loading queue."""
     cell = Cell({1: c(7, 1), 2: c(4, 0), 3: c(6, 1)}, loading_station=(0.06, 0.06))
     assert cell.table.command("Reset", "") == (True, ErrorID.NONE)
     assert cell.run(1, lambda: cell.table.state == ModuleState.RESETTING)
@@ -122,6 +128,7 @@ def test_reset_routes_the_shuttles_into_the_loading_queue():
 
 
 def test_a_stop_during_resetting_stops_the_auto_routing():
+    """Verify Stop during Reset cancels auto routing."""
     cell = Cell({1: c(7, 1), 2: c(4, 0)}, loading_station=(0.06, 0.06))
     assert cell.table.command("Reset", "") == (True, ErrorID.NONE)
     cell.run(1.0)
@@ -134,6 +141,7 @@ def test_a_stop_during_resetting_stops_the_auto_routing():
 
 
 def test_more_shuttles_than_one_auto_routing_command_takes_are_lined_up_by_the_planner():
+    """Verify oversized loading groups fall back to planned placement."""
     table = Layout(cols=4, rows=3)  # 8 x 6 slots
     xbots = {k + 1: c(7 - k % 4, 5 - k // 4) for k in range(12)}  # the far corner, 4 x 3
     cell = Cell(xbots, layout=table, loading_station=(0.06, 0.06), idle_rz=math.radians(90))
@@ -146,6 +154,7 @@ def test_more_shuttles_than_one_auto_routing_command_takes_are_lined_up_by_the_p
 
 
 def test_a_boxed_in_shuttle_keeps_its_slot_while_the_others_line_up_and_turn():
+    """Verify a boxed-in shuttle stays put while other shuttles gather and turn."""
     # Turns claim flyways near the queue; one xbot is left without a free slot it can reach, and
     # the slot it stays on is not given to another as well.
     slots = [(6, 3), (2, 4), (3, 4), (7, 2), (6, 5), (5, 3), (0, 1), (4, 5), (2, 3), (0, 3)]
@@ -161,6 +170,7 @@ def test_a_boxed_in_shuttle_keeps_its_slot_while_the_others_line_up_and_turn():
 
 
 def test_reset_turns_every_shuttle_to_the_idle_orientation():
+    """Verify Reset aligns shuttles with the idle orientation."""
     cell = Cell({1: c(7, 1), 2: c(4, 0), 3: c(6, 1)}, loading_station=(0.06, 0.06), idle_rz=math.radians(90))
     cell.sim.xbots[2].rz = math.radians(-90)
     cell.sim.xbots[3].rz = math.radians(180)

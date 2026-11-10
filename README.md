@@ -92,6 +92,14 @@ Discovery Server and 4841 by UaExpert: set `OPCUA_ENDPOINT=opc.tcp://127.0.0.1:4
 
 ## A first move
 
+The existing planner remains the default (`PLANNER=classic`). To try the experimental
+rounded-corner executor, set `PLANNER=blended` in `.env` and recreate the container, or run
+`python -m planar --planner blended` with your usual connection options. Restart with
+`--planner classic` to switch back. Both use the same OPC UA interface and route search;
+the experimental coordinator lives in `planar/coordinator_blended.py`. It blends one clear
+XY corner at a time in free mode; line mode and constrained corners keep the old behavior.
+See [experimental blended execution](mkdocs/docs/planner.md#experimental-blended-execution).
+
 With [asyncua](https://github.com/FreeOpcUa/opcua-asyncio): bring the table up, occupy a
 shuttle, move it, release it. Each call answers `[True, 0]` when it is accepted.
 

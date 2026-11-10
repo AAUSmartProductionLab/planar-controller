@@ -1,14 +1,4 @@
-"""
-Contention stress on the simulated driver: many xbots ask for the same place; each that gets
-there stays a while (pinned, as a station would hold it), then leaves for its own parking spot
-and is released. The places are of every kind: slot centres, between slots, slot corners, flyway
-centres, turned and crooked.
-
-Checks: every request succeeds, arrivals follow request order (same-tick requests: by xbot id),
-no collision, no hang. Prints one line per bad run and a summary.
-
-    python tests/stress_contention.py [seeds]      # 12 runs per seed, about 0.7 s a run
-"""
+"""Stress shared-destination ordering and collision avoidance on simulated tables."""
 import logging
 import math
 import os
@@ -50,6 +40,7 @@ def poses(layout, rng):
 
 
 def valid(layout, pose):
+    """Whether a generated pose fits the table and obeys rotation-location constraints."""
     x, y, rz, _ = pose
     if not layout.on_table(x, y, math.radians(rz)):
         return False
@@ -59,11 +50,13 @@ def valid(layout, pose):
 
 
 def free_of(layout, pose, others):
+    """Whether a generated pose avoids all previously chosen xbot footprints."""
     box = layout.square(pose[0], pose[1], math.radians(pose[2]))
     return all(not overlap(box, layout.square(o[0], o[1], math.radians(o[2]))) for o in others)
 
 
 def trial(layout, n, seed, stagger, dwell):
+    """Run one seeded shared-destination scenario and report completion, ordering and collision failures."""
     rng = random.Random(seed)
     # The contested spot, then distinct start poses (square-aligned) and parking spots.
     while True:
@@ -147,6 +140,7 @@ def trial(layout, n, seed, stagger, dwell):
 
 
 def main():
+    """Run the requested seed count across table sizes and traffic patterns, then summarize failures."""
     logging.disable(logging.CRITICAL)
     bad = runs = 0
     t0 = time.time()

@@ -1,33 +1,4 @@
-"""
-Run the planar table controller: python -m planar
-
-Environment (each also an option, see --help):
-  PMC_IP          the PMC's address (empty: auto search)
-  OPCUA_ENDPOINT  where the OPC UA server listens (opc.tcp://0.0.0.0:4840/)
-  SHUTTLES        the xbot ids to offer as shuttles, e.g. "1,2,3" (empty: the ids the PMC knows)
-  AUTOSTART       1 to Reset and Start the table when the controller starts
-  DISPLACE_HELD   1 to let the planner push occupied shuttles that are not moving
-  BLOCKED_TIMEOUT_S  seconds a move may wait without getting closer before it fails with
-                  Blocked (20); 0 (the default): it waits until the way is free or it is stopped
-  LOADING_STATION "X,Y" in mm: the xbots nobody holds queue up there, and the table's Reset
-                  sends them there (empty: an idle xbot stays where it was)
-  IDLE_RZ         degrees, a multiple of 90: the xbots nobody holds are turned to it, and the
-                  table's Reset turns every shuttle to it (empty: as they are); also
-                  PlanarTable/Equipment/IdleRz over OPC UA
-  MODE            free (the default): the xbots may travel anywhere on the table; line: only
-                  on the lanes of LINE_LAYOUT (see planar/lines.py)
-  LINE_LAYOUT     line mode: the layout's JSON file, or an http(s) URL to fetch it from (e.g.
-                  the $value of the line AAS's Parameters/PlanarRouting), read again at every
-                  Reset of the table; its idleArea is the loading queue
-  ZONES           zones of the table to switch off for loading xbots on and off, or to slow
-                  down in: a JSON file or URL (see planar/zones.py); PlanarTable/Equipment/Zones
-  XBOT_SPEED      m/s (0.5) and XBOT_ACCEL m/s^2 (2.0) every xbot moves at, or slower (a
-                  shuttle's own SetSpeed, a payload the PMC allows less with); also
-                  PlanarTable/Equipment/SetSpeed over OPC UA. XBOT_JERK m/s^3 (empty: the PMC's)
-  LOG_LEVEL       INFO
-
-It stops on Ctrl+C, Ctrl+Break and SIGTERM (docker stop), and then disconnects from the PMC.
-"""
+"""Run the planar controller and its OPC UA server; see mkdocs/docs/configuration.md for settings."""
 
 import argparse
 import asyncio
@@ -48,10 +19,12 @@ log = logging.getLogger("planar")
 
 
 def _env(name, default=""):
+    """Read an environment setting, using the default when it is empty."""
     return os.environ.get(name, "").strip() or default
 
 
 def _flag(name):
+    """Parse an environment setting as a Boolean flag."""
     return _env(name).lower() in ("1", "true", "yes", "on")
 
 
@@ -74,7 +47,7 @@ def _positive(text):
 
 
 def _ids(text):
-    """ "1,2,3" -> [1, 2, 3]; empty -> None."""
+    """"1,2,3" -> [1, 2, 3]; empty -> None."""
     if not text.strip():
         return None
     try:
@@ -84,19 +57,21 @@ def _ids(text):
 
 
 def _mode(text):
+    """Validate and normalize the free or line routing mode."""
     if text.strip().lower() not in ("free", "line"):
         raise argparse.ArgumentTypeError(f"free or line, not {text!r}")
     return text.strip().lower()
 
 
 def _level(text):
+    """Validate and normalize a logging level."""
     if text.strip().upper() not in logging.getLevelNamesMapping():
         raise argparse.ArgumentTypeError(f"DEBUG, INFO, WARNING or ERROR, not {text!r}")
     return text.strip().upper()
 
 
 def _point_mm(text):
-    """ "X,Y" in mm -> (x, y) in m; empty -> None."""
+    """"X,Y" in mm -> (x, y) in m; empty -> None."""
     if not text or not text.strip():
         return None
     try:
@@ -120,6 +95,7 @@ def _quarter_deg(text):
 
 
 def parse_args():
+    """Parse command-line options with environment variables as defaults."""
     p = argparse.ArgumentParser(prog="python -m planar", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     # Each defaults to its environment variable, which argparse reads as if it were given here.
@@ -132,6 +108,8 @@ def parse_args():
     p.add_argument("--loading-station", type=_point_mm, metavar="X,Y", default=_env("LOADING_STATION"))
     p.add_argument("--idle-rz", type=_quarter_deg, metavar="DEG", default=_env("IDLE_RZ"))
     p.add_argument("--mode", type=_mode, metavar="free|line", default=_env("MODE", "free"))
+    p.add_argument("--planner", choices=("classic", "blended"), default=_env("PLANNER", "classic"),
+                   help="classic (default) or experimental blended XY corners; restart to switch")
     p.add_argument("--line-layout", metavar="FILE|URL", default=_env("LINE_LAYOUT"))
     p.add_argument("--zones", metavar="FILE|URL", default=_env("ZONES"))
     p.add_argument("--speed", type=_positive, metavar="M/S", default=_env("XBOT_SPEED", "0.5"))
@@ -142,7 +120,7 @@ def parse_args():
 
 
 async def detect(driver):
-    """The xbot ids the PMC knows; waits for the PMC rather than giving up."""
+    """Wait for a PMC connection and return its sorted xbot IDs."""
     while True:
         try:
             shuttles = sorted(await asyncio.to_thread(driver.detect))
@@ -155,7 +133,7 @@ async def detect(driver):
 
 
 async def line_layout(source, retry_s=10.0):
-    """The line layout; from a URL it waits for the server rather than giving up."""
+    """Load a line layout, retrying unavailable URLs and rejecting invalid layouts."""
     while True:
         try:
             spec = await asyncio.to_thread(lines.load, source)
@@ -172,8 +150,7 @@ async def line_layout(source, retry_s=10.0):
 
 
 async def autostart(ctl, retry_s=10.0):
-    """Reset and Start the table; while the PMC is not there yet (it may still be starting up),
-    try again every retry_s. It gives up only when someone else has commanded the table."""
+    """Retry Reset and Start until ready or another command changes the table state."""
     while True:
         with ctl.lock:
             if ctl.table.state != ModuleState.STOPPED:
@@ -194,6 +171,7 @@ async def autostart(ctl, retry_s=10.0):
 
 
 async def main():
+    """Configure the driver and OPC UA server, then serve until interrupted."""
     args = parse_args()
     logging.basicConfig(level=args.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("asyncua").setLevel(logging.WARNING)  # it logs every request at INFO
@@ -213,7 +191,7 @@ async def main():
         log.info("zones: %s", ", ".join(z.name for z in zone_specs) or "none")
     driver = PmcDriver(args.pmc_ip, jerk=args.jerk)
     shuttles = args.shuttles or await detect(driver)
-    ctl = PlanarController(driver, shuttles, displace_held=args.displace_held, speed=args.speed, accel=args.accel,
+    ctl = PlanarController(driver, shuttles, planner=args.planner, displace_held=args.displace_held, speed=args.speed, accel=args.accel,
                            patience_s=args.blocked_timeout or None, loading_station=args.loading_station,
                            idle_rz=args.idle_rz, line_spec=line_spec,
                            line_source=(lambda: lines.load(args.line_layout)) if line_spec else None,
@@ -239,6 +217,7 @@ async def main():
 
 
 def _interrupt(signum, frame):
+    """Translate an operating-system signal into KeyboardInterrupt."""
     raise KeyboardInterrupt(signal.Signals(signum).name)
 
 

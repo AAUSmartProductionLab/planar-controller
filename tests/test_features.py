@@ -1,5 +1,4 @@
-"""Hold and Unhold, speed, the payload, accidents, mastership, zones and the flyways' status, on
-the simulated table through the modules, as an orchestrator uses them."""
+"""Check Hold, speed, payload, recovery, zones and telemetry through controller modules."""
 
 import math
 
@@ -16,6 +15,7 @@ SERVICE = ZoneSpec("Service", (0.72, 0.48, 0.96, 0.72))  # SIM's flyway (3, 2): 
 # --- Hold and Unhold -----------------------------------------------------------------------------
 
 def test_a_held_table_pauses_the_moves_for_as_long_as_it_is_held_and_unheld_they_go_on():
+    """Verify table Hold freezes active moves until Unhold."""
     cell = Cell({1: c(0, 0)})
     cell.up()
     cell.s[1].occupation.occupy("A")
@@ -38,6 +38,7 @@ def test_a_held_table_pauses_the_moves_for_as_long_as_it_is_held_and_unheld_they
 
 
 def test_one_shuttle_held_stops_alone_the_others_go_on_and_it_is_unheld_only_with_the_table_in_execute():
+    """Verify a shuttle can be held independently and resumes only under an executing table."""
     cell = Cell({1: c(0, 0), 2: c(0, 1)})
     cell.up()
     for xid in (1, 2):
@@ -57,6 +58,7 @@ def test_one_shuttle_held_stops_alone_the_others_go_on_and_it_is_unheld_only_wit
 
 
 def test_a_stop_while_held_lets_the_move_end_and_fails_it_interrupted():
+    """Verify Stop while held resumes the committed move and reports interruption."""
     cell = Cell({1: c(0, 0)})
     cell.up()
     cell.s[1].occupation.occupy("A")
@@ -71,6 +73,7 @@ def test_a_stop_while_held_lets_the_move_end_and_fails_it_interrupted():
 
 
 def test_an_abort_while_held_leaves_no_xbot_paused():
+    """Verify Abort while held leaves no paused xbot behind."""
     cell = Cell({1: c(0, 0)})
     cell.up()
     cell.s[1].occupation.occupy("A")
@@ -83,6 +86,7 @@ def test_an_abort_while_held_leaves_no_xbot_paused():
 
 
 def test_the_pmc_pauses_only_the_motions_in_flight_each_once():
+    """Verify only active motions receive a pause command, once each."""
     cell = Cell({1: c(0, 0), 2: c(0, 1)})
     cell.up()
     cell.s[1].occupation.occupy("A")
@@ -95,6 +99,7 @@ def test_the_pmc_pauses_only_the_motions_in_flight_each_once():
 
 
 def test_a_skill_stopped_while_held_stays_put_until_unheld_and_then_fails_interrupted():
+    """Verify a skill stopped during Hold waits for Unhold before completing its interruption."""
     cell = Cell({1: c(0, 0)})
     cell.up()
     cell.s[1].occupation.occupy("A")
@@ -114,13 +119,16 @@ def test_a_skill_stopped_while_held_stays_put_until_unheld_and_then_fails_interr
 # --- speed ---------------------------------------------------------------------------------------
 
 def test_the_tables_speed_and_a_shuttles_own_limit_set_how_fast_its_xbot_moves():
+    """Verify effective motion limits combine table and shuttle settings."""
     cell = Cell({1: c(0, 0), 2: c(3, 0)})
     assert cell.ctl.set_speed(1, "", 0.2, 0.0) == (False, ErrorID.XBOT_NOT_DETECTED), "not before the first Reset"
     cell.up()
     cell.s[1].occupation.occupy("A")
 
     def moves():
-        """{(speed, accel)} of xbot 1's motions there and back: past 2 (planned), and short of it (straight)."""
+        """{(speed, accel)} of xbot 1's motions there and back: past 2 (planned), and short of it
+        (straight).
+        """
         since = len(cell.sim.commands)
         for to in (c(7, 0), c(0, 0), c(2, 0), c(0, 0)):
             assert cell.move(1, "A", *to) == (True, ErrorID.NONE)
@@ -147,6 +155,7 @@ def test_the_tables_speed_and_a_shuttles_own_limit_set_how_fast_its_xbot_moves()
 # --- the payload ---------------------------------------------------------------------------------
 
 def test_the_occupant_sets_the_payload_the_pmc_refuses_too_much_and_the_moves_keep_to_its_acceleration():
+    """Verify payload authorization, rejection and acceleration limits."""
     cell = Cell({1: c(0, 0)})
     cell.up()
     agent = cell.coord.agents[1]
@@ -159,6 +168,7 @@ def test_the_occupant_sets_the_payload_the_pmc_refuses_too_much_and_the_moves_ke
     assert (agent.payload, agent.max_accel) == ((0.3, 0.02), 20.0)
 
     def there_and_back():
+        """Measure simulated round-trip time with the currently configured payload."""
         t0 = cell.t
         for to in (c(7, 0), c(0, 0)):
             assert cell.move(1, "A", *to) == (True, ErrorID.NONE)
@@ -178,6 +188,7 @@ def test_the_occupant_sets_the_payload_the_pmc_refuses_too_much_and_the_moves_ke
 # --- accidents -----------------------------------------------------------------------------------
 
 def test_an_xbot_the_pmc_switched_off_after_an_accident_is_recovered_by_its_shuttles_reset():
+    """Verify shuttle Reset recovers an accident-disabled xbot."""
     cell = Cell({1: c(0, 0)})
     cell.up()
     cell.s[1].occupation.occupy("A")
@@ -197,6 +208,7 @@ def test_an_xbot_the_pmc_switched_off_after_an_accident_is_recovered_by_its_shut
 
 
 def test_the_tables_reset_recovers_the_xbots_after_an_accident():
+    """Verify table Reset recovers accident-disabled xbots."""
     cell = Cell({1: c(0, 0)})
     cell.sim.accident(1)
     cell.up()
@@ -206,6 +218,7 @@ def test_the_tables_reset_recovers_the_xbots_after_an_accident():
 # --- mastership ----------------------------------------------------------------------------------
 
 def test_another_program_taking_mastership_aborts_the_table_with_mastership_lost_and_a_reset_takes_it_back():
+    """Verify mastership loss aborts the table and Reset can reacquire control."""
     cell = Cell({1: c(0, 0)})
     cell.up()
     cell.s[1].occupation.occupy("A")
@@ -227,6 +240,7 @@ def test_another_program_taking_mastership_aborts_the_table_with_mastership_lost
 # --- zones ---------------------------------------------------------------------------------------
 
 def test_a_zone_switched_off_is_kept_clear_its_xbots_swapped_by_hand_and_switched_on_it_is_part_of_the_table():
+    """Verify deactivated zones stay clear while xbots are exchanged and reactivated."""
     cell = Cell({1: c(0, 0), 2: c(7, 5), 3: c(0, 5)}, layout=SIM, zones=[SERVICE])
     cell.up()
     zone = cell.coord.zones["Service"]
@@ -253,6 +267,7 @@ def test_a_zone_switched_off_is_kept_clear_its_xbots_swapped_by_hand_and_switche
     entered = []
 
     def watch():
+        """Record any mover footprint entering the closed zone."""
         xb = cell.sim.xbots[1]
         if overlap(cell.sim.layout.square(xb.x, xb.y, xb.rz), box):
             entered.append((xb.x, xb.y))
@@ -276,6 +291,7 @@ def test_a_zone_switched_off_is_kept_clear_its_xbots_swapped_by_hand_and_switche
 
 
 def test_a_move_through_a_slow_zone_does_not_time_out_though_the_pmc_says_it_takes_less():
+    """Verify slow-zone travel receives enough time to finish."""
     slow = ZoneSpec("Slow", (0.0, 0.0, 0.96, 0.24), 0.2)  # SIM's first row of flyways, at a fifth of the speed
     cell = Cell({1: c(0, 1), 2: c(4, 0)}, layout=SIM, zones=[slow])
     cell.up()
@@ -289,6 +305,7 @@ def test_a_move_through_a_slow_zone_does_not_time_out_though_the_pmc_says_it_tak
 
 
 def test_a_zone_off_the_table_fails_the_reset():
+    """Verify an off-table zone causes Reset to fail."""
     cell = Cell({1: c(0, 0)}, layout=SIM, zones=[ZoneSpec("Out", (0.9, 0.0, 1.2, 0.24))])
     assert cell.table.command("Reset", "") == (True, ErrorID.NONE)
     assert cell.run(1, lambda: cell.table.state == ModuleState.STOPPED)
@@ -306,11 +323,13 @@ def test_a_zone_off_the_table_fails_the_reset():
     ('[]', '"zones"'),
 ])
 def test_what_are_no_zones_says_why(text, problem):
+    """Verify invalid zone definitions produce explanatory errors."""
     with pytest.raises(ZoneError, match=problem):
         parse(text)
 
 
 def test_zones_are_read_in_mm_corners_either_way_round():
+    """Verify zone coordinates accept millimetres and either corner order."""
     (zone,) = parse('{"zones": [{"name": "Filling", "from": [480, 720], "to": [240, 480], "speed": 0.5}]}')
     assert zone == ZoneSpec("Filling", (0.24, 0.48, 0.48, 0.72), 0.5)
 
@@ -318,6 +337,7 @@ def test_zones_are_read_in_mm_corners_either_way_round():
 # --- the flyways, and stopping ---------------------------------------------------------------------
 
 def test_the_flyways_power_and_temperatures_are_read_now_and_then_and_the_pmc_disconnected_at_the_end():
+    """Verify periodic flyway telemetry and driver disconnection on shutdown."""
     cell = Cell({1: c(0, 0)})
     cell.sim.flyway_status = {(0, 0): (12.0, 41.0, 36.0, 30.5)}
     cell.up()

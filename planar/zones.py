@@ -1,22 +1,4 @@
-"""
-Zones of the table (ZONES): rectangles the PMC knows as zones, for loading xbots onto the table
-and taking them off while the rest goes on, and for slowing the xbots down near a station.
-
-    {"zones": [
-        {"name": "Service", "from": [720, 480], "to": [960, 720]},
-        {"name": "Filling", "from": [240, 480], "to": [480, 720], "speed": 0.5}
-    ]}
-
-from and to are opposite corners in mm, in the table's coordinates (best on flyway edges);
-speed (0 to 1, default 1) scales the speed and acceleration of every xbot inside the zone; name
-is the zone's name over OPC UA (PlanarTable/Equipment/Zones/<name>).
-
-A zone is switched off (Deactivate): the PMC fences it and switches off the xbots inside, which
-an operator may then take off the table, or new ones may be put on. Switched on again (Activate)
-the PMC levitates the xbots inside, and the controller removes the fence. While a zone is not
-switched on and unfenced, the planner keeps every xbot out of it and a target inside it is
-refused (ZoneClosed, 33).
-"""
+"""Load named table-zone rectangles and speed factors from JSON or URLs."""
 
 import json
 import re
@@ -27,11 +9,13 @@ _NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}")
 
 
 class ZoneError(ValueError):
+    """Invalid zone JSON, coordinates or speed scaling."""
     pass
 
 
 @dataclass(frozen=True)
 class ZoneSpec:
+    """A named zone rectangle in metres with its speed factor."""
     name: str
     box: tuple          # (x0, y0, x1, y1), m
     speed: float = 1.0  # the PMC's override of speed and acceleration inside
@@ -52,6 +36,7 @@ def load(source):
 
 
 def parse(text):
+    """Validate zone JSON and convert millimetre coordinates to metre-based ZoneSpec objects."""
     try:
         data = json.loads(text)
     except json.JSONDecodeError as e:

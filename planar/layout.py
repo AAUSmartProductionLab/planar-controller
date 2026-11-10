@@ -1,14 +1,4 @@
-"""
-Geometry of the planar table.
-
-The table is a grid of flyways (240 mm), some of which may be missing (holes). The planner does
-not work in millimetres: it works on a lattice of slots one xbot wide (120 mm), so a flyway holds
-2 x 2 slots. An xbot parked on a slot centre with its sides along the axes covers exactly that
-slot, and two xbots on neighbouring slots touch without overlapping, as in the PMC's own home
-layout.
-
-Positions are in metres and radians, as pmclib uses them.
-"""
+"""Model flyways, xbot footprints and routing cells using metres and radians."""
 
 import math
 import xml.etree.ElementTree as ET
@@ -45,6 +35,7 @@ def wrap_angle(rz):
 
 
 def angle_difference(a, b):
+    """Return the absolute shortest angular separation in radians."""
     return abs(wrap_angle(a - b))
 
 
@@ -60,8 +51,9 @@ def hull(*boxes):
 
 
 def steps_from(graph, origin, passable=None):
-    """{slot: steps from origin} for every slot reachable along graph ({slot: [slots]}), entering
-    only passable ones (None: any); in the order they are reached."""
+    """{slot: steps from origin} for every slot reachable along graph ({slot: [slots]}), entering only
+    passable ones (None: any); in the order they are reached.
+    """
     steps = {origin: 0}
     queue = deque([origin])
     while queue:
@@ -81,6 +73,7 @@ def is_square_aligned(rz, tolerance=ANGLE_TOLERANCE_RAD):
 
 @dataclass(frozen=True)
 class Layout:
+    """A flyway grid with missing tiles and square xbot-sized routing cells."""
     cols: int
     rows: int
     holes: frozenset = frozenset()
@@ -88,6 +81,7 @@ class Layout:
     xbot_size: float = 0.12
 
     def __post_init__(self):
+        """Require a whole number of xbot widths per flyway."""
         per = self.flyway_size / self.xbot_size
         if abs(per - round(per)) > 1e-9:
             raise ValueError("the flyway size must be a whole number of xbot widths")
@@ -96,22 +90,27 @@ class Layout:
 
     @property
     def pitch(self):
+        """Return the routing-cell spacing in metres."""
         return self.xbot_size
 
     @property
     def per_flyway(self):
+        """Return the number of routing cells along one flyway edge."""
         return round(self.flyway_size / self.xbot_size)
 
     @property
     def width(self):
+        """Return the table's bounding width in metres."""
         return self.cols * self.flyway_size
 
     @property
     def height(self):
+        """Return the table's bounding height in metres."""
         return self.rows * self.flyway_size
 
     @cached_property
     def cells(self):
+        """Return all usable routing cells, excluding missing flyways."""
         n = self.per_flyway
         return frozenset(
             (i, j)
@@ -122,14 +121,17 @@ class Layout:
 
     @cached_property
     def adjacency(self):
+        """Map each usable cell to its usable orthogonal neighbours."""
         return {c: [d for d in self._four(c) if d in self.cells] for c in self.cells}
 
     @staticmethod
     def _four(c):
+        """Return the four orthogonal neighbours of a cell, including out-of-table cells."""
         i, j = c
         return [(i + 1, j), (i - 1, j), (i, j + 1), (i, j - 1)]
 
     def center(self, cell):
+        """Return a cell centre in metres."""
         return ((cell[0] + 0.5) * self.pitch, (cell[1] + 0.5) * self.pitch)
 
     def cell_at(self, x, y, rz=0.0, tolerance=SLOT_TOLERANCE_M):
@@ -152,6 +154,7 @@ class Layout:
         return frozenset((i, j) for i in range(i0, i1 + 1) for j in range(j0, j1 + 1))
 
     def on_table(self, x, y, rz=0.0):
+        """Whether the xbot's entire footprint lies on usable flyways."""
         return self.footprint(x, y, rz) <= self.cells
 
     # --- boxes: (x0, y0, x1, y1), what an xbot covers or a move sweeps -----------------------
@@ -162,15 +165,14 @@ class Layout:
         return (x - half, y - half, x + half, y + half)
 
     def cell_box(self, cell):
+        """Return the square footprint of an xbot centred on a cell."""
         x, y = self.center(cell)
         return self.square(x, y)
 
     def trail(self, start, target):
-        """What the PMC keeps clear for a straight move from start to target, as Planar Motor's
-        simulator does: the box the move sweeps, from a slot back from its start, and whatever
-        touches it (TRAIL_MARGIN_M). A move of another xbot into it is stopped with
-        XBOT_OBSTACLE_DETECTED while the move still has more than about 0.65 s to go, though the
-        xbot has long left those slots."""
+        """Return a move's protected sweep, extended one cell behind its start and by TRAIL_MARGIN_M. This
+        models the simulator's obstacle check.
+        """
         (sx, sy), (tx, ty) = start, target
         d = math.hypot(tx - sx, ty - sy)
         k = self.pitch / d if d > EXACT_M else 0.0
@@ -186,6 +188,7 @@ class Layout:
         return hull(self.square(sx + (tx - sx) * k, sy + (ty - sy) * k), self.square(tx, ty))
 
     def flyway_box(self, flyway):
+        """Return a flyway's bounding box in metres."""
         c, r = flyway
         s = self.flyway_size
         return (c * s, r * s, (c + 1) * s, (r + 1) * s)
@@ -205,14 +208,17 @@ class Layout:
 
     @cached_property
     def flyways(self):
+        """Iterate the existing flyway coordinates."""
         return [(c, r) for c in range(self.cols) for r in range(self.rows) if (c, r) not in self.holes]
 
     def flyway_cells(self, flyway):
+        """Return the routing cells within a flyway."""
         n = self.per_flyway
         c, r = flyway
         return frozenset((c * n + a, r * n + b) for a in range(n) for b in range(n))
 
     def flyway_center(self, flyway):
+        """Return a flyway's centre in metres."""
         return ((flyway[0] + 0.5) * self.flyway_size, (flyway[1] + 0.5) * self.flyway_size)
 
     def flyway_at(self, x, y, tolerance=POSITION_TOLERANCE_M):
@@ -238,10 +244,12 @@ class Layout:
                 if {(c - 1, r - 1), (c, r - 1), (c - 1, r), (c, r)} <= present]
 
     def spot_box(self, spot):
+        """Return the bounding box reserved for rotation at a spot."""
         half = self.flyway_size / 2
         return (spot[0] - half, spot[1] - half, spot[0] + half, spot[1] + half)
 
     def spot_cells(self, spot):
+        """Return existing cells covered by a rotation spot's reservation."""
         return self.cells_in(self.spot_box(spot))
 
     def spot_at(self, x, y, tolerance=POSITION_TOLERANCE_M):
@@ -264,6 +272,7 @@ class Layout:
 
 
 def _pmc_flyways(path):
+    """Parse flyway dimensions and mapped coordinates from a PMC configuration XML file."""
     with open(path, "rb") as f:
         content = f.read().replace(b"\x00", b"").decode("ISO-8859-1").strip()
     root = ET.fromstring(content)
@@ -291,5 +300,6 @@ def parse_pmc_config(path):
 
 def pmc_flyway_ids(path):
     """{(column, row): the PMC's flyway id}: the flyways numbered from 1 in the order of the
-    configuration's mapping."""
+    configuration's mapping.
+    """
     return {flyway: k for k, flyway in enumerate(_pmc_flyways(path)[2], start=1)}

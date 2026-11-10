@@ -1,51 +1,4 @@
-"""
-Line mode: the xbots travel on lanes laid out on the slot lattice, so the way between two places
-is always the same one, instead of anywhere on the table (free mode).
-
-The layout is JSON, in mm in the table's coordinates (as the skill's X and Y):
-
-    {
-      "lanes": [
-        {"name": "loop", "points": [[60, 60], [900, 60], [900, 660], [60, 660], [60, 60]], "oneWay": true},
-        {"name": "cross", "points": [[420, 60], [420, 660]]}
-      ],
-      "turnSpots": [[120, 600]],
-      "idleArea": [[180, 180], [180, 540]]
-    }
-
-- lanes: each a line through slot centres, every stretch of it along a row or a column. A one-way
-  lane is driven from its first point to its last, the others both ways. Where lanes meet or
-  cross an xbot may go from one onto the other; between two lane slots side by side there is no
-  way but along a lane. The lanes together must lead from every lane slot to every other.
-- A target off the lanes (a station beside them) is reached from the lane slot nearest to it,
-  the shortest way across slots of no lane, and left the same way. Only the xbot going there or
-  coming from there drives on those slots.
-- turnSpots: the points xbots turn on, each a flyway's centre or a point where four flyways meet
-  (the PMC turns an xbot nowhere else; another point in a flyway stands for its centre), with a
-  lane slot under it. An xbot turns on the one nearest to it along the lanes, and waits there
-  while another turns on it; none: any flyway centre. A target turned off the axes is still turned
-  on its own spot.
-- idleArea: a line like a lane's: the loading queue in order, its first point the loading
-  position. The free xbots wait there, reached and left like a target off the lanes.
-
-The planner then plans on the directed graph of slots this gives (graph), and keeps every xbot
-off the slots it may not use (keep_out).
-
-In an AAS the layout is a collection, PlanarRouting (in the line's Parameters), and its $value is
-read as it is:
-
-    PlanarRouting                  SubmodelElementCollection
-      Lanes                        SubmodelElementList of collections, each:
-        Name                         Property xs:string
-        OneWay                       Property xs:boolean
-        Points                       SubmodelElementList of points
-      TurnSpots                    SubmodelElementList of points
-      IdleArea                     SubmodelElementList of points
-    a point:                       SubmodelElementCollection of X and Y, Properties xs:double in mm
-
-    {"Lanes": [{"Name": "loop", "OneWay": "true", "Points": [{"X": "180", "Y": "180"}, ...]}],
-     "TurnSpots": [{"X": "840", "Y": "360"}], "IdleArea": [...]}
-"""
+"""Load lane layouts and build constrained routing graphs; configuration coordinates use millimetres."""
 
 import json
 import math
@@ -61,11 +14,13 @@ POINT_TOLERANCE_M = 0.0005
 
 
 class LineError(ValueError):
+    """An invalid lane definition or a layout incompatible with the table."""
     pass
 
 
 @dataclass(frozen=True)
 class Lane:
+    """A named polyline in metres with its one-way or bidirectional travel rule."""
     name: str
     points: tuple      # ((x, y), ...) in m
     one_way: bool
@@ -81,8 +36,9 @@ class LineSpec:
 
 
 def load(source):
-    """The layout from a file or an http(s) URL (e.g. the $value of a PlanarRouting collection in
-    an AAS repository). OSError if it cannot be read, LineError if it is no layout."""
+    """The layout from a file or an http(s) URL (e.g. the $value of a PlanarRouting collection in an AAS
+    repository). OSError if it cannot be read, LineError if it is no layout.
+    """
     if source.startswith(("http://", "https://")):
         with urllib.request.urlopen(source, timeout=10) as response:
             data = response.read()
@@ -96,6 +52,7 @@ def load(source):
 
 
 def parse(text):
+    """Validate JSON lane data and return a LineSpec, accepting the AAS value representation too."""
     try:
         data = json.loads(text)
         if isinstance(data, str):  # a JSON string holding it (an AAS Property's $value)
@@ -125,11 +82,13 @@ def parse(text):
 
 
 def _from_aas(data):
-    """The layout from the value of an AAS PlanarRouting collection (its $value, see above) in the
-    JSON file's form. A repository may give the values as text ("180", "true")."""
+    """Convert an AAS PlanarRouting value into the layout JSON shape, including textual numbers and
+    Booleans.
+    """
     _known(data, {"Lanes", "TurnSpots", "IdleArea"}, "PlanarRouting")
 
     def number(v, what):
+        """Convert an AAS numeric value, raising LineError for invalid input."""
         if isinstance(v, str):
             try:
                 v = float(v)
@@ -140,6 +99,7 @@ def _from_aas(data):
         return v
 
     def points(value, what):
+        """Extract an ordered list of XY points from an AAS collection."""
         if value is None:
             return []
         if not isinstance(value, list):
@@ -169,12 +129,14 @@ def _from_aas(data):
 
 
 def _known(data, keys, what):
+    """Reject unsupported configuration keys with a contextual LineError."""
     unknown = set(data) - keys
     if unknown:
         raise LineError(f"{what}: unknown {', '.join(sorted(unknown))} (known: {', '.join(sorted(keys))})")
 
 
 def _points(value, what, minimum):
+    """Validate finite XY coordinates in millimetres and return point pairs in metres."""
     if not isinstance(value, list) or len(value) < minimum:
         raise LineError(f"{what}: a list of at least {minimum} [x, y] points in mm")
     out = []
@@ -187,10 +149,12 @@ def _points(value, what, minimum):
 
 
 class Lines:
-    """A layout put on a table: the slot graph and what each xbot may use. LineError if it does
-    not fit the table."""
+    """A layout put on a table: the slot graph and what each xbot may use. LineError if it does not fit the
+    table.
+    """
 
     def __init__(self, spec, layout):
+        """Validate the layout against the table and build lanes, idle cells and rotation spots."""
         self.spec = spec
         self.layout = layout
         self.lanes = [(lane, self._trace(lane.points, lane.name)) for lane in spec.lanes]
@@ -209,10 +173,12 @@ class Lines:
         self.idle_region = frozenset(self.idle).union(*[self.spur(c) for c in self.idle])
 
     def _mm(self, cell):
+        """Format a cell centre in millimetres for error messages."""
         x, y = self.layout.center(cell)
         return f"({x * 1000:.0f}, {y * 1000:.0f}) mm"
 
     def _cell(self, point, what):
+        """Resolve a point to a usable slot centre or raise LineError."""
         cell = self.layout.cell_at(*point)
         if cell is None:
             raise LineError(f"{what}: ({point[0] * 1000:g}, {point[1] * 1000:g}) mm is not a slot centre on the table")
@@ -234,6 +200,7 @@ class Lines:
         return cells
 
     def _spot(self, point):
+        """Validate a configured rotation spot and return its position in metres."""
         layout = self.layout
         where = f"turnSpots: ({point[0] * 1000:g}, {point[1] * 1000:g}) mm"
         spot = layout.spot_at(*point)
@@ -250,8 +217,9 @@ class Lines:
         return spot
 
     def _graph(self):
-        """Between two lane slots only along a lane (and only forward on a one-way one); any other
-        step between neighbouring slots both ways (who may take it, keep_out decides)."""
+        """Between two lane slots only along a lane (and only forward on a one-way one); any other step
+        between neighbouring slots both ways (who may take it, keep_out decides).
+        """
         along = set()
         for lane, cells in self.lanes:
             for a, b in zip(cells, cells[1:]):
@@ -263,6 +231,7 @@ class Lines:
                 for c in self.layout.cells}
 
     def _check_connected(self):
+        """Reject lanes that are not mutually reachable in the directed lane graph."""
         lanes = self.lane_cells
         first = min(lanes)
         for edges, way in ((self.graph, "to"), (self.reverse, "from")):
@@ -273,8 +242,9 @@ class Lines:
                                 "every lane slot must lead to every other (mind the one-way lanes)")
 
     def spur(self, cell):
-        """This slot and the shortest way from it across slots of no lane to the nearest lane slot
-        (that one not counted); nothing for a lane slot."""
+        """This slot and the shortest way from it across slots of no lane to the nearest lane slot (that
+        one not counted); nothing for a lane slot.
+        """
         if cell in self.lane_cells:
             return frozenset()
         if cell not in self._spurs:
@@ -297,8 +267,9 @@ class Lines:
         return self._spurs[cell]
 
     def keep_out(self, cells, idle=False):
-        """The slots an xbot may not enter that starts on or goes to these slots (idle: one nobody
-        holds, which may also wait in the idle area)."""
+        """The slots an xbot may not enter that starts on or goes to these slots (idle: one nobody holds,
+        which may also wait in the idle area).
+        """
         allowed = set(self.lane_cells)
         for cell in cells:
             if cell is not None:
@@ -308,8 +279,7 @@ class Lines:
         return self.layout.cells - allowed
 
     def describe(self):
-        """The table as text, top row first: '>' '<' '^' 'v' a one-way lane, '+' a two-way lane
-        slot or a crossing, 'I' the idle area, 'T' a turn spot's slot, '#' another slot, '.' a hole."""
+        """Render lane directions, crossings, idle areas and turn spots as a top-first text grid."""
         n = self.layout.per_flyway
         marks = {}
         arrows = {(1, 0): ">", (-1, 0): "<", (0, 1): "^", (0, -1): "v"}

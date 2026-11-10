@@ -20,6 +20,7 @@ variable.
 | `IDLE_RZ` | `--idle-rz` | empty | Degrees, a multiple of 90, e.g. `0`. The free xbots are turned to it, and the table's Reset turns every shuttle to it. Empty: as they are. Also `PlanarTable/Equipment/IdleRz` over OPC UA. |
 | `MODE` | `--mode` | `free` | `free`: the xbots may travel anywhere on the table. `line`: only on the lanes of `LINE_LAYOUT`. See [Line mode](line-mode.md). |
 | `LINE_LAYOUT` | `--line-layout` | empty | Line mode: the layout, a JSON file (in Docker, a file in `config/`) or an `http(s)://` URL, e.g. the `$value` of a `PlanarRouting` collection in an AAS. Read again at every Reset of the table. |
+| `PLANNER` | `--planner` | `classic` | `classic`: existing coordinator; `blended`: experimental rounded XY corners in free mode. Restart to switch. See [blended execution](planner.md#experimental-blended-execution). |
 | `ZONES` | `--zones` | empty | Zones of the table: a JSON file or URL. See [Zones](zones.md). |
 | `XBOT_SPEED` | `--speed` | `0.5` | m/s: every xbot's speed, at most. `PlanarTable/Equipment/SetSpeed` changes it while the controller runs. See [Speed and payload](speed-and-payload.md). |
 | `XBOT_ACCEL` | `--accel` | `2.0` | m/s²: every xbot's acceleration, at most. |

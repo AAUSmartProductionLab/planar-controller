@@ -1,3 +1,5 @@
+"""Check routing, reservations and task lifecycle on both coordinator variants."""
+
 import math
 import random
 import threading
@@ -5,6 +7,7 @@ import threading
 import pytest
 
 from planar.coordinator import Coordinator, Pose
+from planar.coordinator_blended import Coordinator as BlendedCoordinator
 from planar.layout import Layout
 from planar.sim_driver import SimDriver
 from planar.statemachines import ErrorID
@@ -14,12 +17,21 @@ LAB = Layout(cols=3, rows=4, holes=frozenset({(2, 3)}))
 STRIP = Layout(cols=4, rows=1)  # 8 x 2 slots
 
 
+@pytest.fixture(autouse=True, params=[Coordinator, BlendedCoordinator], ids=['classic', 'blended'])
+def coordinator_variant(request, monkeypatch):
+    """Run each scenario against either the classic or blended coordinator."""
+    monkeypatch.setitem(globals(), 'Coordinator', request.param)
+
+
 def c(i, j):
+    """Return a routing-cell centre in metres."""
     return ((i + 0.5) * 0.12, (j + 0.5) * 0.12)
 
 
 class Harness:
+    """Run coordinator scenarios with a simulated driver and explicit clock."""
     def __init__(self, layout, xbots, **kw):
+        """Connect a simulated table and initialize per-xbot completion records."""
         self.lock = threading.RLock()
         self.t = 0.0
         self.sim = SimDriver(layout, xbots)
@@ -28,12 +40,15 @@ class Harness:
         self.results = {}
 
     def send(self, xid, x, y, rz_deg=0.0):
+        """Submit an XY target in metres and Rz in degrees, recording its result."""
         def finished(ok, error, results, xid=xid):
+            """Append one task result to the selected xbot's completion history."""
             self.results.setdefault(xid, []).append((ok, ErrorID(error), results))
         with self.lock:
             return self.coord.submit(xid, Pose(x, y, math.radians(rz_deg)), finished)
 
     def run(self, seconds, until=None):
+        """Advance simulated time until the duration expires or the predicate succeeds."""
         for _ in range(int(seconds / 0.02)):
             self.t += 0.02
             self.sim.advance(self.t)
@@ -43,13 +58,16 @@ class Harness:
         return until is None
 
     def done(self, *xids):
+        """Return a predicate that waits for at least one completion from every listed xbot."""
         return lambda: all(x in self.results and len(self.results[x]) >= 1 for x in xids)
 
     def assert_no_collisions(self):
+        """Assert that no footprint overlap was recorded during simulation."""
         assert not self.sim.collisions, self.sim.collisions[:3]
 
 
 def test_one_xbot_goes_around_the_hole():
+    """Verify an xbot routes around a missing flyway."""
     h = Harness(SIM, {1: (*c(3, 2), 0.0)})
     assert h.send(1, *c(6, 2)) == ErrorID.NONE
     assert h.run(30, h.done(1))
@@ -59,6 +77,7 @@ def test_one_xbot_goes_around_the_hole():
 
 
 def test_two_xbots_pass_in_a_one_lane_passage_and_a_parked_one_makes_way():
+    """Verify opposing traffic passes using a pocket and displacing a free xbot."""
     # Lane j=1 is walled by pinned xbots except the pockets at i=0, 4 and 7.
     walls = {10 + i: (*c(i, 1), 0.0) for i in (1, 2, 3, 5, 6)}
     h = Harness(STRIP, {1: (*c(0, 0), 0.0), 2: (*c(7, 0), 0.0), 3: (*c(4, 0), 0.0), **walls})
@@ -76,6 +95,7 @@ def test_two_xbots_pass_in_a_one_lane_passage_and_a_parked_one_makes_way():
 
 
 def test_a_pinned_xbot_is_never_pushed_and_the_task_waits_then_fails():
+    """Verify a pinned obstacle remains fixed while a blocked task times out."""
     h = Harness(STRIP, {1: (*c(0, 0), 0.0), 2: (*c(3, 0), 0.0), 3: (*c(3, 1), 0.0)}, patience_s=5)
     h.coord.pin(2, True)
     h.coord.pin(3, True)
@@ -88,6 +108,7 @@ def test_a_pinned_xbot_is_never_pushed_and_the_task_waits_then_fails():
 
 
 def test_rotation_happens_at_a_cleared_flyway_centre():
+    """Verify rotation waits for a cleared flyway centre."""
     # xbot 2 idles on the flyway xbot 1 will want to turn on.
     h = Harness(SIM, {1: (*c(0, 0), 0.0), 2: (*c(1, 1), 0.0)})
     assert h.send(1, *c(0, 1), rz_deg=90) == ErrorID.NONE
@@ -102,6 +123,7 @@ def test_rotation_happens_at_a_cleared_flyway_centre():
 
 
 def test_docking_between_slots_and_at_a_flyway_centre():
+    """Verify docking reaches off-grid targets and flyway centres."""
     h = Harness(SIM, {1: (0.12, 0.12, 0.0), 2: (*c(7, 5), 0.0)})  # 1 starts docked on a flyway centre
     h.coord.pin(1, True)  # occupied, as an orchestrator's xbots are: they stay where they arrive
     h.coord.pin(2, True)
@@ -120,6 +142,7 @@ def test_docking_between_slots_and_at_a_flyway_centre():
 
 
 def test_an_unoccupied_xbot_off_the_lattice_steps_back_onto_it():
+    """Verify an idle off-grid xbot returns to the routing lattice."""
     h = Harness(SIM, {1: (0.12, 0.12, math.radians(45)), 2: (0.24, 0.42, 0.0)})
     h.run(5)
     for xid in (1, 2):
@@ -129,6 +152,7 @@ def test_an_unoccupied_xbot_off_the_lattice_steps_back_onto_it():
 
 
 def test_targets_it_cannot_reach_are_refused():
+    """Verify invalid target poses are rejected."""
     h = Harness(SIM, {1: (*c(0, 0), 0.0)})
     assert h.send(1, 0.60, 0.36) == ErrorID.NOT_ON_TABLE       # in the hole
     assert h.send(1, *c(0, 0), rz_deg=30) == ErrorID.ANGLE_NOT_ALLOWED  # 30 degrees off a flyway centre
@@ -138,6 +162,7 @@ def test_targets_it_cannot_reach_are_refused():
 
 
 def test_halt_ends_interrupted_on_a_slot_and_abort_stops_at_once():
+    """Verify Halt ends at a committed endpoint while Abort stops immediately."""
     h = Harness(SIM, {1: (*c(0, 0), 0.0), 2: (*c(0, 5), 0.0)})
     h.send(1, *c(7, 0))
     h.send(2, *c(7, 5))
@@ -162,6 +187,7 @@ def test_halt_ends_interrupted_on_a_slot_and_abort_stops_at_once():
 
 @pytest.mark.parametrize("layout,n,seed", [(SIM, 4, 1), (SIM, 6, 2), (LAB, 6, 3), (LAB, 10, 4)])
 def test_random_traffic(layout, n, seed):
+    """Verify seeded random traffic finishes without collisions."""
     rng = random.Random(seed)
     cells = sorted(layout.cells)
     starts = rng.sample(cells, n)
@@ -193,6 +219,7 @@ def test_random_traffic(layout, n, seed):
 
 
 def test_a_target_a_millimetre_off_a_slot_centre_is_reached_exactly_and_covers_both_slots():
+    """Verify a slightly off-centre target is reached and reserves both overlapped cells."""
     h = Harness(SIM, {1: (*c(0, 0), 0.0), 2: (*c(5, 0), 0.0)}, patience_s=3)
     h.coord.pin(1, True)
     h.coord.pin(2, True)
@@ -213,6 +240,7 @@ def test_a_target_a_millimetre_off_a_slot_centre_is_reached_exactly_and_covers_b
 
 
 def test_xbots_off_the_lattice_may_touch_where_they_share_slots():
+    """Verify touching off-grid xbots may share routing cells without colliding."""
     # What was tried by hand: 2 parked on the flyway centre (120, 120), 1 sent to (240, 120),
     # which shares two slots with it but only touches it at x = 180 mm.
     h = Harness(SIM, {1: (0.30, 0.18, 0.0), 2: (0.12, 0.12, 0.0)}, patience_s=10)
@@ -235,6 +263,7 @@ def test_xbots_off_the_lattice_may_touch_where_they_share_slots():
 
 
 def test_leaving_a_shared_slot_steps_onto_one_the_neighbour_does_not_reach_into():
+    """Verify undocking chooses a cell clear of the neighbouring footprint."""
     # 1 at (240, 120) touches 2 at (120, 120); slots (1, 0) and (1, 1) are under both.
     h = Harness(SIM, {1: (0.24, 0.12, 0.0), 2: (0.12, 0.12, 0.0)})
     h.coord.pin(2, True)
@@ -248,6 +277,7 @@ def test_leaving_a_shared_slot_steps_onto_one_the_neighbour_does_not_reach_into(
 
 
 def test_a_turn_on_a_flyway_centre_waits_for_a_neighbour_reaching_into_it():
+    """Verify rotation waits for a neighbour overlapping its flyway."""
     h = Harness(SIM, {1: (0.12, 0.12, 0.0), 2: (0.24, 0.12, 0.0)}, patience_s=3)
     h.coord.pin(1, True)
     h.coord.pin(2, True)
@@ -265,6 +295,7 @@ def test_a_turn_on_a_flyway_centre_waits_for_a_neighbour_reaching_into_it():
 
 
 def test_requests_for_a_taken_place_wait_and_are_served_oldest_first():
+    """Verify requests for an occupied target are served oldest first."""
     # What was tried by hand: 2 parks on (120, 120); 3 and then 1 are sent there; 2 leaves
     # only after more than a minute. 3 (the older request) gets the place, 1 the next turn.
     h = Harness(SIM, {1: (*c(6, 4), 0.0), 2: (0.12, 0.12, 0.0), 3: (*c(6, 0), 0.0)})
@@ -286,6 +317,7 @@ def test_requests_for_a_taken_place_wait_and_are_served_oldest_first():
 
 
 def test_requests_made_at_once_for_the_same_place_do_not_wait_for_each_other():
+    """Verify simultaneous requests do not form a mutual waiting dependency."""
     h = Harness(SIM, {1: (*c(0, 4), 0.0), 2: (*c(3, 0), 0.0)})
     h.coord.pin(1, True)
     h.coord.pin(2, True)
@@ -297,6 +329,7 @@ def test_requests_made_at_once_for_the_same_place_do_not_wait_for_each_other():
 
 
 def test_a_short_move_with_nothing_in_the_way_is_one_straight_move():
+    """Verify an unobstructed short route uses one direct motion."""
     # By hand: from (850, 120) to (850, 240) it went over a slot centre, corner to corner.
     h = Harness(SIM, {1: (0.85, 0.12, 0.0), 2: (*c(0, 5), 0.0)})
     h.coord.pin(1, True)
@@ -308,6 +341,7 @@ def test_a_short_move_with_nothing_in_the_way_is_one_straight_move():
 
 
 def test_a_longer_route_has_one_corner_not_a_staircase():
+    """Verify a longer route favours one corner over a staircase."""
     # 2 stands in the box of the straight line, so 1 is planned: right, then up.
     h = Harness(SIM, {1: (*c(0, 0), 0.0), 2: (*c(1, 2), 0.0)})
     h.coord.pin(2, True)
@@ -320,6 +354,7 @@ def test_a_longer_route_has_one_corner_not_a_staircase():
 
 
 def test_into_and_out_of_a_gap_between_two_xbots_it_touches_on_both_sides():
+    """Verify docking and undocking in a gap touching both neighbours."""
     # 1 at (120, 120) and 3 at (360, 120) leave (240, 120) between them: every slot it covers is
     # partly under one of them, so the way in is from above, straight down; and out the same way.
     h = Harness(SIM, {1: (0.12, 0.12, 0.0), 2: (*c(1, 4), 0.0), 3: (0.36, 0.12, 0.0)})
@@ -337,6 +372,7 @@ def test_into_and_out_of_a_gap_between_two_xbots_it_touches_on_both_sides():
 
 
 def test_three_xbots_touching_in_a_row_change_places_round():
+    """Verify three touching xbots can exchange positions without collisions."""
     row = {1: (0.12, 0.12), 2: (0.24, 0.12), 3: (0.36, 0.12)}
     h = Harness(SIM, {x: (*p, 0.0) for x, p in row.items()})
     for xid in row:
@@ -351,6 +387,7 @@ def test_three_xbots_touching_in_a_row_change_places_round():
 
 
 def test_many_requests_at_once_for_one_place_are_served_in_the_order_they_were_made():
+    """Verify competing destination requests retain submission order."""
     starts = {1: c(0, 0), 2: c(7, 0), 3: c(0, 5), 4: c(7, 5), 5: c(3, 0)}
     parks = {1: c(1, 0), 2: c(6, 0), 3: c(1, 5), 4: c(6, 5), 5: c(4, 0)}
     h = Harness(SIM, {x: (*p, 0.0) for x, p in starts.items()})
@@ -374,6 +411,7 @@ def test_many_requests_at_once_for_one_place_are_served_in_the_order_they_were_m
 
 
 def test_stopping_the_oldest_waiting_request_lets_the_next_one_in():
+    """Verify stopping the oldest waiter allows the next request to proceed."""
     h = Harness(SIM, {1: (0.12, 0.12, 0.0), 2: (*c(6, 4), 0.0), 3: (*c(6, 0), 0.0)})
     for xid in (1, 2, 3):
         h.coord.pin(xid, True)
@@ -392,6 +430,7 @@ def test_stopping_the_oldest_waiting_request_lets_the_next_one_in():
 
 
 def test_a_new_request_is_planned_while_others_are_on_their_way():
+    """Verify new tasks are planned while other xbots remain in motion."""
     # 1 goes the long way along row 0 (the straight box is not free: 4 is in it); while it is on
     # its way, 2 is sent around the pinned 3. 2 must not wait for 1 to arrive before it sets off.
     h = Harness(SIM, {1: (*c(0, 0), 0.0), 2: (*c(0, 5), 0.0), 3: (*c(1, 5), 0.0), 4: (*c(5, 1), 0.0)})
@@ -409,6 +448,7 @@ def test_a_new_request_is_planned_while_others_are_on_their_way():
 
 
 def test_a_follower_is_not_sent_into_the_trail_of_a_move_still_on_its_way():
+    """Verify followers wait outside the protected trail of an active move."""
     # The PMC stops a move into what another's move in flight keeps clear, the slots it has left
     # and one behind them (Layout.trail), while that move has far to go: 2 sets off into 1's
     # first slot only once 1 is nearly at the end of its run along row 0, else the simulated PMC
@@ -427,6 +467,7 @@ def test_a_follower_is_not_sent_into_the_trail_of_a_move_still_on_its_way():
 
 
 def test_two_turns_may_wait_for_their_flyways_to_clear_at_once():
+    """Verify two rotation claims can wait for clearance without deadlock."""
     # 3 idles on the flyway 1 turns on, 4 on the one 2 turns on: both claims wait at once.
     h = Harness(SIM, {1: (*c(0, 0), 0.0), 2: (*c(6, 4), 0.0), 3: (*c(1, 1), 0.0), 4: (*c(7, 5), 0.0)})
     with h.lock:
@@ -447,6 +488,7 @@ def test_two_turns_may_wait_for_their_flyways_to_clear_at_once():
 
 
 def test_a_claim_that_would_leave_no_way_out_is_not_made():
+    """Verify a claim is refused when it would trap another xbot."""
     # On the strip: 3 idles in flyway (1, 0); the pinned 5 and 6 wall it off on the left. With 2's
     # claim on flyway (2, 0) it could not get out of 1's claim on (1, 0) to anywhere.
     h = Harness(STRIP, {1: (*c(3, 1), 0.0), 2: (*c(5, 1), 0.0), 3: (*c(2, 0), 0.0),
@@ -464,6 +506,7 @@ def test_a_claim_that_would_leave_no_way_out_is_not_made():
 
 
 def test_idle_xbots_queue_up_at_the_loading_station():
+    """Verify free xbots form the loading queue."""
     # The station is the slot (0, 1) on the left edge; the queue goes along the edges.
     h = Harness(SIM, {1: (*c(7, 5), 0.0), 2: (*c(4, 0), 0.0), 3: (*c(6, 2), 0.0)},
                 loading_station=c(0, 1))
@@ -489,6 +532,7 @@ def test_idle_xbots_queue_up_at_the_loading_station():
 
 
 def test_idle_xbots_are_turned_to_the_idle_orientation_in_the_queue():
+    """Verify queued idle xbots adopt the configured orientation."""
     q = math.radians(90)
     h = Harness(SIM, {1: (*c(7, 5), 0.0), 2: (*c(4, 0), q), 3: (*c(6, 2), -q)},
                 loading_station=c(0, 1), idle_rz=0.0)
@@ -503,6 +547,7 @@ def test_idle_xbots_are_turned_to_the_idle_orientation_in_the_queue():
 
 
 def test_a_request_replaces_a_turn_to_the_idle_orientation():
+    """Verify a user task can replace an internal idle-orientation task."""
     h = Harness(SIM, {1: (*c(0, 0), math.radians(90))}, idle_rz=0.0)
     assert h.run(1, lambda: h.coord.agents[1].task is not None)
     assert h.coord.agents[1].task.internal
@@ -516,6 +561,7 @@ def test_a_request_replaces_a_turn_to_the_idle_orientation():
 
 
 def test_the_idle_orientation_is_a_multiple_of_90_degrees():
+    """Verify idle orientation accepts only quarter turns."""
     h = Harness(SIM, {1: (*c(0, 0), 0.0)})
     assert h.coord.set_idle_rz(math.radians(45)) == ErrorID.OUT_OF_RANGE and h.coord.idle_rz is None
     assert h.coord.set_idle_rz(math.radians(270)) == ErrorID.NONE

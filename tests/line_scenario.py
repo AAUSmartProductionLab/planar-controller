@@ -1,36 +1,4 @@
-"""
-A small production line driven through OPC UA only, the way product agents would drive it.
-
-Five stations at or near the edge of the table, visited clockwise: Infeed, Filling, Stoppering,
-Capping, Outfeed. Each product agent has its own OPC UA client and session. Per product it
-
-1. occupies the first free shuttle in the loading queue, or whichever is free without one (Occupy
-   answers 5 while another session holds one),
-2. takes it through the stations in order, holding each station while its step runs,
-3. may see a process step fail; the product is then discarded and goes straight to the Outfeed,
-4. releases the shuttle at the Outfeed and goes on with its next product.
-
-The stations are reserved the way station modules would be (one product at a time), the moves
-are left to the controller. Everything an agent sees is checked: every command's answer, every
-move ending Succeeded at its target, and a shuttle standing still while a station works on it.
-
-Against a running controller (python -m planar):
-
-    python tests/line_scenario.py --endpoint opc.tcp://127.0.0.1:4840/ --agents 3 --products 3
-
-The stations are STATIONS below unless --stations names a JSON file of {"<station>": [x, y, rz]} (mm,
-degrees, on the table), e.g. the modules' transfer points taken from their AASs, or --layout names
-a folder of config/layouts/ (its stations.json; start the controller with its controller.env):
-
-    python tests/line_scenario.py --layout config/layouts/clockwise-outwards
-
-While the agents run, the shuttles are watched: no two may overlap, every turn must be made on a
-turn spot (in line mode the layout's, else a flyway centre or where four flyways meet) by at most
-half a turn, and in line mode every step from a lane slot to the next must go the lane's way.
-
-With --hold-every S the table is held every S seconds for HOLD_S and unheld: no shuttle may move
-while it is held, and the agents wait for the Unhold where a held shuttle refuses a Start (4).
-"""
+"""Exercise a production line through OPC UA with concurrent product agents and motion checks."""
 
 import argparse
 import asyncio
@@ -67,15 +35,18 @@ HOLD_S = 2.0
 
 
 def _s(value):
+    """Wrap a value as an OPC UA String argument."""
     return ua.Variant(value, ua.VariantType.String)
 
 
 def _d(value):
+    """Wrap a numeric value as an OPC UA Double argument."""
     return ua.Variant(float(value), ua.VariantType.Double)
 
 
 @dataclass
 class Product:
+    """Track a product's assigned shuttle, completed steps and final outcome."""
     agent: str
     name: str
     shuttle: str = ""
@@ -85,6 +56,7 @@ class Product:
 
 @dataclass
 class Report:
+    """Collect product outcomes, command refusals and observed motion problems."""
     products: list = field(default_factory=list)
     problems: list = field(default_factory=list)
     occupy_refusals: int = 0
@@ -96,6 +68,7 @@ class Report:
     holding: bool = False
 
     def problem(self, text):
+        """Record and print a scenario failure."""
         self.problems.append(text)
         print("PROBLEM", text, flush=True)
 
@@ -104,28 +77,34 @@ class Opc:
     """One client's view of the controller."""
 
     def __init__(self, client, ns):
+        """Bind an OPC UA client and namespace with a node lookup cache."""
         self.client = client
         self.ns = ns
         self._nodes = {}
 
     async def node(self, *names):
+        """Resolve and cache a node by its namespaced browse path."""
         if names not in self._nodes:
             self._nodes[names] = await self.client.nodes.objects.get_child([f"{self.ns}:{n}" for n in names])
         return self._nodes[names]
 
     async def read(self, *names):
+        """Read a value from a namespaced browse path."""
         return await (await self.node(*names)).read_value()
 
     async def call(self, path, method, *args):
+        """Call a namespaced method and return Boolean acceptance and integer ErrorID."""
         out = await (await self.node(*path)).call_method(f"{self.ns}:{method}", *args)
         return bool(out[0]), int(out[1])
 
     async def pose(self, shuttle):
+        """Read a shuttle's XY millimetres and Rz degrees together."""
         nodes = [await self.node(shuttle, "Equipment", "Xbot", k) for k in ("X", "Y", "Rz")]
         return await self.client.read_values(nodes)
 
 
 async def _open(endpoint):
+    """Retry connection to the OPC UA endpoint and return its planar namespace wrapper."""
     client = Client(endpoint, timeout=10)
     for _ in range(60):
         try:
@@ -139,6 +118,7 @@ async def _open(endpoint):
 
 
 async def _wait_value(opc, path, wanted, timeout):
+    """Poll until a node reaches one of the wanted values or the timeout expires."""
     t0 = time.monotonic()
     while time.monotonic() - t0 < timeout:
         if await opc.read(*path) in wanted:
@@ -162,6 +142,7 @@ async def bring_up(opc):
 
 
 async def shuttles_of(opc):
+    """Return sorted shuttle module names discovered in the server's Objects folder."""
     names = []
     for child in await opc.client.nodes.objects.get_children():
         name = (await child.read_browse_name()).Name
@@ -171,7 +152,9 @@ async def shuttles_of(opc):
 
 
 class ProductAgent:
+    """Run products through shared stations while occupying one shuttle per product."""
     def __init__(self, name, endpoint, shuttles, stations, report, rng, products, process_s, fail_p, places=None):
+        """Configure the agent's endpoint, stations, workload and simulated process failures."""
         self.name = name
         self.endpoint = endpoint
         self.shuttles = shuttles
@@ -184,6 +167,7 @@ class ProductAgent:
         self.fail_p = fail_p
 
     async def run(self):
+        """Connect, process the assigned products and disconnect in all cases."""
         opc = await _open(self.endpoint)
         try:
             for k in range(self.products):
@@ -192,6 +176,7 @@ class ProductAgent:
             await opc.client.disconnect()
 
     async def make(self, opc, product):
+        """Occupy a shuttle, execute a product's route and release station and shuttle ownership."""
         self.report.products.append(product)
         session = str(uuid.uuid4())
         product.shuttle = await self.occupy(opc, session)
@@ -240,6 +225,7 @@ class ProductAgent:
             await asyncio.sleep(0.2)
 
     async def move(self, opc, product, session, station, leaving):
+        """Start a station move, handle Hold refusals and record its completion or failure."""
         x, y, rz = self.places[station]
         skill = (product.shuttle, "Skills", "MoveToPosition")
         t0 = time.monotonic()
@@ -280,8 +266,7 @@ class ProductAgent:
 
 
 class MotionCheck:
-    """Where the shuttles go between samples: a step from a lane slot to the next against the lane's
-    way (line mode), a turn off a turn spot or by more than half a turn."""
+    """Detect travel against lane directions and rotations outside permitted spots or angles."""
 
     SETTLED_S = 0.3  # a turn is over when the angle has not changed for this long
     # Less is not a turn (every turn is to a multiple of 90 deg): Planar Motor's simulator's xbot
@@ -289,22 +274,26 @@ class MotionCheck:
     JITTER_DEG = 5.0
 
     def __init__(self, table, lines, report):
+        """Build allowed lane transitions and initialize per-shuttle pose history."""
         self.table, self.lines, self.report = table, lines, report
         self.forward = {(a, b) for _, cells in lines.lanes for a, b in zip(cells, cells[1:])} if lines else set()
         self.cell, self.rz, self.turning = {}, {}, {}
 
     def _slot(self, x, y):
+        """Resolve millimetre coordinates to a cell centre within the sampling tolerance."""
         pitch = self.table.pitch * 1000.0
         cell = (int(x // pitch), int(y // pitch))
         on = abs(x - (cell[0] + 0.5) * pitch) < 5.0 and abs(y - (cell[1] + 0.5) * pitch) < 5.0
         return cell if on else None
 
     def _on_spot(self, x, y):
+        """Whether millimetre coordinates lie at a permitted rotation spot."""
         if self.lines and self.lines.turn_spots:
             return any(abs(sx * 1000.0 - x) < 3.0 and abs(sy * 1000.0 - y) < 3.0 for sx, sy in self.lines.turn_spots)
         return self.table.spot_at(x / 1000.0, y / 1000.0, tolerance=0.003) is not None
 
     def sample(self, shuttle, pose, now):
+        """Check a sampled pose against prior motion and record lane or rotation violations."""
         x, y, rz = pose
         cell = self._slot(x, y)
         last = self.cell.get(shuttle)
@@ -348,8 +337,7 @@ async def motion_check(opc, report):
 
 
 async def watch(endpoint, shuttles, report, stop, check=None):
-    """Sample every shuttle's pose; note any two that overlap (axis-aligned squares), and tell the
-    check where each is."""
+    """Sample shuttle poses, detect footprint overlaps and apply optional lane and rotation checks."""
     opc = await _open(endpoint)
     try:
         while not stop.is_set():
@@ -411,8 +399,9 @@ async def holder(endpoint, shuttles, report, stop, every):
 
 async def run_line(endpoint, agents=3, products=3, process_s=(0.5, 1.5), fail_p=0.2, seed=1, sample=True,
                    places=None, hold_every=None):
-    """``places``: where each station of ROUTE is, (x, y, rz) on the table; STATIONS if not given.
-    ``hold_every``: seconds between holds of the table (None: it is not held)."""
+    """Run concurrent product agents with optional sampling and periodic Holds; return the scenario report.
+    Station poses use mm and degrees.
+    """
     places = dict(places or STATIONS)
     report = Report()
     opc = await _open(endpoint)
@@ -441,6 +430,7 @@ async def run_line(endpoint, agents=3, products=3, process_s=(0.5, 1.5), fail_p=
 
 
 def summary(report):
+    """Format product outcomes, motion timings and detected problems for the console."""
     finished = sum(p.outcome == "finished" for p in report.products)
     discarded = sum(p.outcome.startswith("discarded") for p in report.products)
     moves = [t for p in report.products for _, t in p.steps]
@@ -466,6 +456,7 @@ def read_stations(path):
 
 
 def main():
+    """Parse scenario options, load station positions and run the OPC UA production-line test."""
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--endpoint", default="opc.tcp://127.0.0.1:4840/")
     p.add_argument("--agents", type=int, default=3)

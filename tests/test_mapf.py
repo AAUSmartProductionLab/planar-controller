@@ -1,3 +1,5 @@
+"""Check multi-xbot path validity, dependencies and execution-time estimates."""
+
 import random
 
 import pytest
@@ -10,6 +12,7 @@ SIM = Layout(cols=4, rows=3, holes=frozenset({(2, 1)}))
 
 
 def check(instance, result):
+    """Assert path start, legal transitions and the final goal for complete plans."""
     assert result.configs[0] == instance.starts
     for a, b in zip(result.configs, result.configs[1:]):
         assert valid_step(instance, a, b)
@@ -18,6 +21,7 @@ def check(instance, result):
 
 
 def corridor(length, pocket_at=None):
+    """Build a one-cell-wide passage graph with an optional passing pocket."""
     cells = {(i, 0) for i in range(length)}
     if pocket_at is not None:
         cells.add((pocket_at, 1))
@@ -27,6 +31,7 @@ def corridor(length, pocket_at=None):
 
 
 def test_two_xbots_pass_each_other_in_a_one_lane_passage_with_a_pocket():
+    """Verify two xbots pass in a narrow corridor using a pocket."""
     cells, adjacency = corridor(7, pocket_at=3)
     inst = Instance(cells, adjacency, starts=[(0, 0), (6, 0)], goals=[(6, 0), (0, 0)])
     result = plan(inst, timeout=2)
@@ -35,6 +40,7 @@ def test_two_xbots_pass_each_other_in_a_one_lane_passage_with_a_pocket():
 
 
 def test_a_parked_xbot_in_the_passage_steps_into_the_pocket_and_back():
+    """Verify a free blocking xbot steps aside and returns."""
     cells, adjacency = corridor(9, pocket_at=4)
     # xbot 1 is parked in the middle of the passage and must end where it started.
     inst = Instance(cells, adjacency, starts=[(0, 0), (6, 0), (8, 0)], goals=[(8, 0), (6, 0), (0, 0)])
@@ -44,6 +50,7 @@ def test_a_parked_xbot_in_the_passage_steps_into_the_pocket_and_back():
 
 
 def test_no_way_past_is_reported_not_hung():
+    """Verify an impassable corridor produces an incomplete result rather than hanging."""
     cells, adjacency = corridor(6)
     inst = Instance(cells, adjacency, starts=[(0, 0), (5, 0)], goals=[(5, 0), (0, 0)])
     result = plan(inst, timeout=2)
@@ -52,6 +59,7 @@ def test_no_way_past_is_reported_not_hung():
 
 
 def test_keep_out_is_respected_and_xbots_leave_it():
+    """Verify forbidden cells cannot be entered but can be left."""
     cells, adjacency = LAB.cells, LAB.adjacency
     zone = LAB.flyway_cells((1, 1))
     start_in_zone = sorted(zone)[0]
@@ -67,6 +75,7 @@ def test_keep_out_is_respected_and_xbots_leave_it():
 
 @pytest.mark.parametrize("layout,n", [(LAB, 4), (LAB, 8), (LAB, 20), (SIM, 8), (SIM, 24)])
 def test_random_instances(layout, n):
+    """Verify seeded random routing instances produce valid plans."""
     rng = random.Random(n)
     for _ in range(10):
         cells = sorted(layout.cells)
@@ -79,6 +88,7 @@ def test_random_instances(layout, n):
 
 
 def test_of_the_shortest_paths_a_straight_one_is_taken():
+    """Verify equal-length paths favour straight travel."""
     for seed in range(10):
         inst = Instance(SIM.cells, SIM.adjacency, starts=[(0, 0)], goals=[(3, 5)])
         result = plan(inst, timeout=1, seed=seed)
@@ -90,6 +100,7 @@ def test_of_the_shortest_paths_a_straight_one_is_taken():
 
 
 def test_a_corner_costs_a_stop_and_a_start():
+    """Verify timing estimates include acceleration and braking at corners."""
     straight = [((0, 0),), ((1, 0),), ((2, 0),), ((3, 0),)]
     corner = [((0, 0),), ((1, 0),), ((1, 1),), ((2, 1),)]
     staircase = [((0, 0),), ((1, 0),), ((1, 1),), ((2, 1),), ((2, 2),)]
@@ -100,6 +111,7 @@ def test_a_corner_costs_a_stop_and_a_start():
 
 
 def test_a_follower_waits_until_the_one_ahead_has_left():
+    """Verify a follower waits until its predecessor has cleared the cell."""
     # 0 follows 1 along a row: it may start into (1, 0) only once 1 has reached (2, 0).
     configs = [((0, 0), (1, 0)), ((1, 0), (2, 0))]
     m = Motion()
@@ -109,6 +121,7 @@ def test_a_follower_waits_until_the_one_ahead_has_left():
 
 
 def test_each_xbot_is_estimated_with_its_own_motion():
+    """Verify timing uses each xbot's individual motion limits."""
     # Two xbots two slots along their own rows, one of them slower: the plan is done when it is.
     configs = [((0, 0), (0, 1)), ((1, 0), (1, 1)), ((2, 0), (2, 1))]
     fast, slow = Motion(), Motion(speed=0.2, accel=0.5)
@@ -118,12 +131,14 @@ def test_each_xbot_is_estimated_with_its_own_motion():
 
 
 def test_slots_an_xbot_in_flight_has_to_leave_hold_the_plan_back():
+    """Verify pending cell departures become dependencies in a new plan."""
     # Something not in the plan is still leaving (1, 0) by its move 7.
     (move,), = actions([((0, 0),), ((1, 0),)], first_id=10, leaving={(1, 0): 7})
     assert move == (10, (0, 0), (1, 0), 7)
 
 
 def test_of_the_seeds_tried_the_fastest_plan_is_taken():
+    """Verify seed selection favours the fastest estimated complete plan."""
     rng = random.Random(5)
     cells = sorted(SIM.cells)
     pick = rng.sample(cells, 32)

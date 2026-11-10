@@ -10,6 +10,7 @@ SIM = Layout(cols=4, rows=3, holes=frozenset({(2, 1)}))  # the simulation tool's
 
 
 def c(i, j):
+    """Return a routing-cell centre in millimetres for skill parameters."""
     return ((i + 0.5) * 120.0, (j + 0.5) * 120.0)  # slot (i, j)'s centre in mm, as the skill takes them
 
 
@@ -17,6 +18,7 @@ class Cell:
     """PlanarController on SimDriver; xbots {xid: (x mm, y mm)}, turned 0."""
 
     def __init__(self, xbots, layout=STRIP, **options):
+        """Create the simulated controller from millimetre poses with a manually advanced clock."""
         self.t = 0.0
         self.sim = SimDriver(layout, {xid: (x / 1000, y / 1000, 0.0) for xid, (x, y) in xbots.items()})
         self.ctl = PlanarController(self.sim, sorted(xbots), clock=lambda: self.t, plan_timeout=0.3, **options)
@@ -46,10 +48,13 @@ class Cell:
         assert all(s.state == ModuleState.EXECUTE for s in self.s.values())
 
     def skill(self, xid):
+        """Return the selected shuttle's MoveToPosition skill."""
         return self.s[xid].skills["MoveToPosition"]
 
     def move(self, xid, session, x, y, rz=0.0):
+        """Start a position skill using X/Y millimetres and Rz degrees."""
         return self.skill(xid).start(session, {"X": x, "Y": y, "Rz": rz})
 
     def x(self, xid):
+        """Return the simulated xbot's X coordinate in metres."""
         return self.sim.xbots[xid].x

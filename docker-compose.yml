@@ -26,6 +26,7 @@ services:
       LOADING_STATION: ${LOADING_STATION:-}
       IDLE_RZ: ${IDLE_RZ:-}
       MODE: ${MODE:-free}
+      PLANNER: ${PLANNER:-classic}
       LINE_LAYOUT: ${LINE_LAYOUT:-}
       ZONES: ${ZONES:-}
       XBOT_SPEED: ${XBOT_SPEED:-0.5}

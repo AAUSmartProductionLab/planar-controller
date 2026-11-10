@@ -13,6 +13,8 @@ extend it, e.g. with a driver for another kind of table.
 | `planar/modules.py` | `PlanarController`: the table and shuttle modules wired to the coordinator. Their procedures, the `MoveToPosition` skill, the equipment commands, and which xbots are pinned. |
 | `planar/coordinator.py` | `Coordinator`: turns tasks into plans and plans into motions, every 20 ms. Turns, stations, claims, the loading queue, Hold, zones, speed. |
 | `planar/mapf.py` | The multi-xbot path finder: LaCAM with PIBT, the dependencies between moves, the time estimate. |
+| `planar/coordinator_blended.py` | Optional experimental coordinator, selected with `PLANNER=blended`. Reuses the classic lifecycle and route search, but reserves and executes eligible pairs of straight runs as one rounded XY macro. |
+| `planar/rounded_path.py` | Quarter-circle path geometry and conservative swept footprint for the experimental executor and kinematic simulator. |
 | `planar/layout.py` | `Layout`: the table's geometry, the slots, footprints, spots, boxes and trails. |
 | `planar/lines.py` | Line mode: the layout's JSON (or AAS) form, the slot graph, and which slots each xbot may use. |
 | `planar/zones.py` | The zones of `ZONES`. |

@@ -1,3 +1,5 @@
+"""Check lane-layout parsing, constrained travel, rotation spots and traffic progress."""
+
 import json
 import math
 import random
@@ -34,15 +36,19 @@ LOOP = {
 
 
 def c(i, j):
+    """Return a routing-cell centre in metres."""
     return ((i + 0.5) * 0.12, (j + 0.5) * 0.12)
 
 
 def lines(layout=LOOP, table=TABLE):
+    """Parse the supplied lane definition and apply it to the test table."""
     return Lines(parse(json.dumps(layout)), table)
 
 
 class Harness:
+    """Track simulated lane travel, occupied footprints and move completion."""
     def __init__(self, xbots, layout=LOOP, **kw):
+        """Connect a line-mode coordinator and initialize trajectory tracking."""
         self.lock = threading.RLock()
         self.t = 0.0
         self.sim = SimDriver(TABLE, {xid: (*c(*cell), 0.0) for xid, cell in xbots.items()})
@@ -54,6 +60,7 @@ class Harness:
         self.covered = set()  # every slot an xbot has been over
 
     def go(self, xid, cell, rz_deg=0.0, seconds=60):
+        """Move to a cell with Rz in degrees and return whether it succeeds before the deadline."""
         done = []
         with self.lock:
             assert self.coord.submit(xid, Pose(*c(*cell), math.radians(rz_deg)),
@@ -62,6 +69,7 @@ class Harness:
         return done[0]
 
     def run(self, seconds, until=None):
+        """Advance simulated time while recording lane travel and checking collisions."""
         for _ in range(int(seconds / 0.02)):
             self.t += 0.02
             self.sim.advance(self.t)
@@ -88,6 +96,7 @@ class Harness:
     ({"lanes": [{"points": [[60, 60], [180, 60]], "oneWay": "yes"}]}, "oneWay is true or false"),
 ])
 def test_what_is_no_layout_says_why(layout, message):
+    """Verify malformed lane definitions produce explanatory errors."""
     with pytest.raises(LineError, match=message):
         parse(layout if isinstance(layout, str) else json.dumps(layout))
 
@@ -106,18 +115,21 @@ def test_what_is_no_layout_says_why(layout, message):
      "passes a slot twice"),
 ])
 def test_a_layout_that_does_not_fit_the_table_says_why(layout, table, message):
+    """Verify layouts incompatible with the table are rejected."""
     with pytest.raises(LineError, match=message):
         lines(layout, table)
 
 
 def test_a_layout_inside_a_json_string_is_read_too():
+    """Verify a JSON string containing a layout is accepted."""
     spec = parse(json.dumps(json.dumps(LOOP)))  # an AAS Property's $value
     assert len(spec.lanes) == 2 and spec.idle_area[0] == (0.06, 0.18)
 
 
 def aas_form(layout):
-    """The layout as the $value of an AAS PlanarRouting collection, its values as text (as BaSyx
-    gives them)."""
+    """The layout as the $value of an AAS PlanarRouting collection, its values as text (as BaSyx gives
+    them).
+    """
     point = lambda p: {"X": str(p[0]), "Y": str(p[1])}
     return {"Lanes": [{"Name": lane.get("name", ""), "OneWay": str(lane.get("oneWay", False)).lower(),
                        "Points": [point(p) for p in lane["points"]]} for lane in layout["lanes"]],
@@ -126,6 +138,7 @@ def aas_form(layout):
 
 
 def test_a_layout_is_read_from_an_aas_planar_routing_collection():
+    """Verify AAS PlanarRouting values are converted into lane layouts."""
     spec = parse(json.dumps(aas_form(LOOP)))
     assert spec.lanes == parse(json.dumps(LOOP)).lanes
     assert spec.turn_spots == ((0.84, 0.36),) and spec.idle_area == ((0.06, 0.18), (0.06, 0.54))
@@ -142,11 +155,13 @@ def test_a_layout_is_read_from_an_aas_planar_routing_collection():
     ({"Lanes": [{"Points": [{"X": "60", "Y": "60"}, {"X": "180", "Y": "60"}], "OneWay": "yes"}]}, "oneWay is true or false"),
 ])
 def test_what_is_no_planar_routing_says_why(value, message):
+    """Verify invalid AAS routing values produce explanatory errors."""
     with pytest.raises(LineError, match=message):
         parse(json.dumps(value))
 
 
 def test_lanes_are_driven_only_along_them_and_one_way_lanes_only_forward():
+    """Verify lane travel obeys geometry and one-way directions."""
     ln = lines()
     on_lanes = lambda cell: {d for d in ln.graph[cell] if d in ln.lane_cells}
     assert on_lanes((2, 1)) == {(3, 1)}                      # on along the loop, not back
@@ -160,6 +175,7 @@ def test_lanes_are_driven_only_along_them_and_one_way_lanes_only_forward():
 
 
 def test_a_turn_spot_may_be_where_four_flyways_meet():
+    """Verify four-flyway junctions are accepted as rotation spots."""
     ln = lines({**LOOP, "turnSpots": [[720, 480], [820, 400]]})
     assert ln.turn_spots == [pytest.approx((0.72, 0.48)), pytest.approx((0.84, 0.36))]  # the second: its flyway's centre
     assert TABLE.spot_cells(ln.turn_spots[0]) == {(5, 3), (6, 3), (5, 4), (6, 4)}
@@ -169,6 +185,7 @@ def test_a_turn_spot_may_be_where_four_flyways_meet():
 
 
 def test_a_slot_off_the_lanes_is_reached_the_shortest_way_from_the_nearest_lane_slot():
+    """Verify off-lane cells use the shortest spur from the nearest lane."""
     ln = lines()
     assert ln.spur((7, 0)) == {(7, 0), (6, 0)}
     assert ln.spur((5, 2)) == {(5, 2)}
@@ -181,6 +198,7 @@ def test_a_slot_off_the_lanes_is_reached_the_shortest_way_from_the_nearest_lane_
 # --- the coordinator in line mode ------------------------------------------------------------
 
 def test_a_one_way_lane_is_driven_round_even_to_the_slot_behind():
+    """Verify one-way travel goes around the loop to reach a cell behind it."""
     h = Harness({1: (3, 1)})
     assert h.go(1, (2, 1))
     assert h.visited[1] == [(3, 1), (3, 2), (3, 3), (3, 4), (2, 4), (1, 4), (1, 3), (1, 2), (1, 1), (2, 1)]
@@ -188,6 +206,7 @@ def test_a_one_way_lane_is_driven_round_even_to_the_slot_behind():
 
 
 def test_a_station_off_the_lanes_is_reached_from_the_nearest_lane_slot_and_turned_on_the_turn_spot():
+    """Verify off-lane docking uses a nearby spur and the configured rotation spot."""
     h = Harness({1: (1, 1)})
     assert h.go(1, (7, 0), rz_deg=90)
     path = h.visited[1]
@@ -204,6 +223,7 @@ def _spy_turns(h):
     rotate = h.sim.rotate
 
     def spy(xid, rz):
+        """Record the rotation location before forwarding the move to the simulated driver."""
         xb = h.sim.xbots[xid]
         turns.append((xid, (round(xb.x * 1000), round(xb.y * 1000))))
         return rotate(xid, rz)
@@ -212,6 +232,7 @@ def _spy_turns(h):
 
 
 def test_an_xbot_turns_where_four_flyways_meet():
+    """Verify an xbot can rotate at a four-flyway junction."""
     h = Harness({1: (1, 1)}, layout={**LOOP, "turnSpots": [[720, 480]]})
     turns = _spy_turns(h)
     assert h.go(1, (2, 5), rz_deg=90)
@@ -220,6 +241,7 @@ def test_an_xbot_turns_where_four_flyways_meet():
 
 
 def test_xbots_wait_for_the_turn_spot_nearest_to_them_rather_than_drive_on_to_another():
+    """Verify xbots wait for the nearest configured rotation spot."""
     # Two turn spots on the loop: (840, 360) on its right side, met first from the bottom, and
     # (600, 600) on its top. All three turn on the first, one after the other.
     h = Harness({1: (5, 1), 2: (4, 1), 3: (3, 1)}, layout={**LOOP, "turnSpots": [[840, 360], [600, 600]]})
@@ -240,6 +262,7 @@ CLOCKWISE = json.loads((Path(__file__).parent.parent / "config" / "layouts" / "c
 
 
 def test_round_the_sides_facing_outwards_every_turn_is_a_quarter_turn_on_a_turn_spot():
+    """Verify outward-facing loop travel uses quarter turns at designated spots."""
     h = Harness({1: (0, 4)}, layout=CLOCKWISE)
     turns = _spy_turns(h)
     sides = [((2, 5), 90), ((7, 2), 0), ((4, 0), -90), ((0, 1), 180)]  # north, east, south, west
@@ -256,6 +279,7 @@ def test_round_the_sides_facing_outwards_every_turn_is_a_quarter_turn_on_a_turn_
 
 
 def test_free_xbots_queue_in_the_idle_area_and_are_pushed_only_along_the_lanes():
+    """Verify free xbots queue in the idle area and displacement follows lanes."""
     h = Harness({1: (2, 1), 2: (5, 4), 3: (6, 2)})
     h.run(30)
     assert {h.coord.agents[x].cell for x in (1, 2, 3)} == {(0, 1), (0, 2), (0, 3)}
@@ -266,6 +290,7 @@ def test_free_xbots_queue_in_the_idle_area_and_are_pushed_only_along_the_lanes()
 
 
 def test_several_xbots_keep_to_the_lanes():
+    """Verify multiple xbots remain on permitted lanes."""
     h = Harness({1: (0, 1), 2: (0, 2), 3: (4, 1), 4: (6, 4)})
     stations = [(7, 0), (4, 5), (2, 0), (7, 5)]
     done = []
@@ -281,6 +306,7 @@ def test_several_xbots_keep_to_the_lanes():
 
 
 def test_a_layout_that_does_not_fit_the_table_fails_the_connect():
+    """Verify an incompatible line layout prevents connection."""
     sim = SimDriver(TABLE, {1: (*c(0, 0), 0.0)})
     spec = parse(json.dumps({"lanes": [{"points": [[60, 60], [1500, 60]]}]}))
     coord = Coordinator(sim, threading.RLock(), line_spec=spec)
@@ -289,10 +315,12 @@ def test_a_layout_that_does_not_fit_the_table_fails_the_connect():
 
 
 def test_a_reset_reads_the_layout_again_and_says_why_it_does_not_take_one():
+    """Verify Reset reloads the layout and reports invalid replacements."""
     sim = SimDriver(TABLE, {1: (*c(0, 1), 0.0)})
     read = {"layout": LOOP}
 
     def source():
+        """Return the current test layout or raise its configured read error."""
         if isinstance(read["layout"], Exception):
             raise read["layout"]
         return parse(json.dumps(read["layout"]))
@@ -314,21 +342,26 @@ def test_a_reset_reads_the_layout_again_and_says_why_it_does_not_take_one():
 
 
 def test_the_example_layout_fits_the_4_by_3_table():
+    """Verify the bundled example fits the standard simulator table."""
     ln = Lines(load(str(Path(__file__).parent.parent / "config" / "line-layout.example.json")), TABLE)
     assert ln.describe() == lines().describe()
 
 
 def test_a_layout_is_fetched_from_a_url_as_from_an_aas_server():
+    """Verify lane layouts can be loaded from an HTTP endpoint."""
     body = json.dumps(aas_form(LOOP)).encode()  # the PlanarRouting collection's $value
 
     class Handler(BaseHTTPRequestHandler):
+        """Serve a fixed lane-layout JSON response from a local test server."""
         def do_GET(self):
+            """Return the test layout as application/json."""
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(body)
 
         def log_message(self, *args):
+            """Suppress HTTP request logging during the test."""
             pass
 
     server = HTTPServer(("127.0.0.1", 0), Handler)
@@ -344,8 +377,7 @@ def test_a_layout_is_fetched_from_a_url_as_from_an_aas_server():
 
 
 def _traffic(n, seed, moves=6, limit_s=400):
-    """n xbots, each sent to `moves` random places on or beside the lanes (some turned), at random
-    times; the way the line-mode stress test runs. (end time, all done, collisions, off lanes)."""
+    """Run seeded lane traffic; return elapsed time, completion status, collisions and off-lane moves."""
     rnd = random.Random(seed)
     ln = lines()
     stations = [s for s in sorted(TABLE.cells) if s not in ln.idle_region and len(ln.spur(s)) <= 2]
@@ -358,10 +390,12 @@ def _traffic(n, seed, moves=6, limit_s=400):
     pending = {}
 
     def send(x):
+        """Choose and submit the next random destination for an xbot."""
         cell = rnd.choice([s for s in stations if s not in pending.values()])
         rz = rnd.choice([0, 0, 90])
 
         def finished(ok, error, results, x=x):
+            """Release the pending destination and decrement the xbot's remaining move count."""
             pending.pop(x, None)
             left[x] -= 1
         pending[x] = cell
@@ -381,6 +415,7 @@ def _traffic(n, seed, moves=6, limit_s=400):
 @pytest.mark.parametrize("n, seed", [(4, 1), pytest.param(8, 1, marks=pytest.mark.slow),
                                      pytest.param(8, 2, marks=pytest.mark.slow)])
 def test_traffic_on_the_loop_finishes_without_deadlock(n, seed):
+    """Verify seeded loop traffic finishes without deadlock."""
     # These once deadlocked at the turn spot: an xbot pushed into a dead end of the one-way loop,
     # a claimer pushed off its turn spot round the loop, a claim trapping one behind it.
     t, done, collisions, off_lanes = _traffic(n, seed)

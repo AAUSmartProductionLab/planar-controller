@@ -1,13 +1,4 @@
-"""
-What the coordinator needs from a PMC: PmcDriver is a real PMC (or Planar Motor's simulator)
-through pmclib, SimDriver a kinematic stand-in for tests. A driver for another kind of table
-implements connect, read, move, rotate and stop; the rest is what a PMC offers besides moving,
-and a driver without it does without (the defaults here).
-
-The coordinator calls a driver from its own thread, but stop(), pause() and resume() a module's
-command may call from anywhere, and OPC UA's methods set the payload and the zones: a driver
-serialises its calls. Units: metres, radians, seconds.
-"""
+"""Define the serialized driver interface and feedback types; units are metres, radians and seconds."""
 
 from dataclasses import dataclass
 
@@ -25,15 +16,27 @@ class Reading:
 
 
 class DriverError(Exception):
+    """A driver failure with the controller ErrorID used by tasks and modules."""
     def __init__(self, message, code=ErrorID.PMC_ERROR):
+        """Store the failure message and normalize its controller error code."""
         super().__init__(message)
         self.code = ErrorID(code)
 
 
 class Driver:
+    """Interface for PMC connection, motion, feedback and optional equipment features. Implementations
+    serialize calls across threads.
+    """
+    supports_blended_moves = False
+
+    def move_blended(self, xid, path, speed, accel) -> float:
+        """A RoundedPath, fixed orientation, ending at rest; estimated duration in seconds."""
+        raise DriverError("this driver has no blended XY motion")
+
     def connect(self):
-        """Connect, take mastership (a DriverError MASTERSHIP_LOST if another program keeps it),
-        recover the xbots the PMC switched off after an accident, levitate; return the Layout."""
+        """Connect, take mastership, recover and levitate xbots, and return the Layout. Raise
+        MASTERSHIP_LOST if control is unavailable.
+        """
         raise NotImplementedError
 
     def read(self) -> dict:
@@ -53,8 +56,9 @@ class Driver:
         raise NotImplementedError
 
     def auto_drive(self, xids, targets, speed, accel):
-        """Route these xbots with the PMC's own auto routing, each to one of the targets ((x, y),
-        any to any), at most speed and accel; the xbots read as moving until they are there."""
+        """Route these xbots with the PMC's own auto routing, each to one of the targets ((x, y), any to
+        any), at most speed and accel; the xbots read as moving until they are there.
+        """
         raise DriverError("this PMC has no auto routing")
 
     def close(self):
@@ -73,8 +77,9 @@ class Driver:
         return None
 
     def set_payload(self, xid, kg, cg_height):
-        """Tell the PMC the xbot's payload; returns the max acceleration with it (m/s^2, None:
-        unknown; the coordinator keeps its moves to it). DriverError OUT_OF_RANGE if too much."""
+        """Set payload kg and centre-of-gravity height m; return max acceleration in m/s^2 or None. Raise
+        OUT_OF_RANGE for unsupported payloads.
+        """
         raise DriverError("this PMC does not take payloads")
 
     def recover(self, xids):

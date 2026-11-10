@@ -1,3 +1,5 @@
+"""Verify the controller's OPC UA address space and commands end to end."""
+
 import asyncio
 import math
 import socket
@@ -16,16 +18,19 @@ SIM = Layout(cols=4, rows=3, holes=frozenset({(2, 1)}))
 
 
 def free_port():
+    """Return an available loopback TCP port; the caller must bind it afterward."""
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
 
 
 def test_a_move_over_opc_ua():
+    """Verify motion, occupation and equipment settings through the OPC UA interface."""
     asyncio.run(_move_over_opc_ua())
 
 
 async def _move_over_opc_ua():
+    """Serve a simulated controller and exercise its published modules, motion and settings."""
     sim = SimDriver(SIM, {1: (0.06, 0.06, 0.0), 2: (0.90, 0.66, 0.0)})
     sim.flyway_status = {(0, 0): (12.0, 41.0, 36.0, 30.5)}
     ctl = PlanarController(sim, [1, 2], zones=[ZoneSpec("Service", (0.72, 0.48, 0.96, 0.72))])
@@ -41,16 +46,20 @@ async def _move_over_opc_ua():
             ns = await client.get_namespace_index(NAMESPACE)
 
             async def path(*names):
+                """Resolve a node by its planar namespace browse path."""
                 return await client.nodes.objects.get_child([f"{ns}:{n}" for n in names])
 
             async def read(*names):
+                """Read the value at a planar namespace browse path."""
                 return await (await path(*names)).read_value()
 
             async def call(node, method, *args):
+                """Call a method and normalize its acceptance and ErrorID result."""
                 out = await node.call_method(f"{ns}:{method}", *args)
                 return out[0], ErrorID(out[1])
 
             async def wait(node, value, timeout=20.0):
+                """Poll until a node equals the expected value or its timeout expires."""
                 t0 = time.monotonic()
                 while time.monotonic() - t0 < timeout:
                     if await node.read_value() == value:
@@ -128,6 +137,7 @@ async def _move_over_opc_ua():
             idle_rz = await path("PlanarTable", "Equipment", "IdleRz")
 
             async def taken(rz, timeout=3.0):  # the controller has it (a write lands on the node at once)
+                """Wait for an IdleRz node write to reach the coordinator."""
                 t0 = time.monotonic()
                 while time.monotonic() - t0 < timeout:
                     if ctl.coordinator.idle_rz == rz:

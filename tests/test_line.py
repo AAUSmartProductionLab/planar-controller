@@ -1,5 +1,4 @@
-"""The production line of line_scenario.py, through OPC UA, on the simulated driver: in real time,
-so most of these are slow."""
+"""Run production-line scenarios through OPC UA against the kinematic simulator."""
 
 import asyncio
 import math
@@ -21,6 +20,7 @@ LAYOUTS = sorted(p for p in (Path(__file__).parent.parent / "config" / "layouts"
 
 
 def free_port():
+    """Return an available loopback TCP port; the caller must bind it afterward."""
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
@@ -28,6 +28,7 @@ def free_port():
 
 async def _line(agents, products, seed, loading_station=None, sample=False, places=None, turn_speed=20.0,
                 hold_every=None, **kw):
+    """Serve a simulated table, run the OPC UA product scenario and clean up its tasks and server."""
     # Three xbots on the flyway centres of the left column, as in the simulation tool; fast moves
     # (turns slow enough to be sampled when the shuttles are watched).
     sim = SimDriver(SIM, {1: (0.12, 0.12, 0.0), 2: (0.12, 0.36, 0.0), 3: (0.12, 0.60, 0.0)},
@@ -60,6 +61,7 @@ INFEED = (0.06, 0.18)  # line_scenario.STATIONS["Infeed"], where the products ar
 @pytest.mark.slow
 @pytest.mark.parametrize("agents,products,seed,loading_station", [(3, 4, 1, None), (4, 3, 2, None), (3, 4, 3, INFEED)])
 def test_product_agents_run_the_line(agents, products, seed, loading_station):
+    """Verify concurrent product agents complete the production line over OPC UA."""
     report, sim = asyncio.run(_line(agents, products, seed, loading_station))
     print(summary(report))
     assert not report.problems, report.problems
@@ -75,7 +77,7 @@ def test_product_agents_run_the_line(agents, products, seed, loading_station):
 @pytest.mark.slow
 @pytest.mark.parametrize("folder", LAYOUTS, ids=lambda p: p.name)
 def test_each_layout_of_config_layouts_runs_the_line(folder):
-    """config/layouts/<name>/: its layout and settings, its stations; the shuttles watched."""
+    """Verify each bundled line layout completes its production scenario."""
     settings = _settings(folder / "controller.env")
     assert settings["MODE"] == "line"
     assert Path(settings["LINE_LAYOUT"]).as_posix() == f"config/layouts/{folder.name}/layout.json"
@@ -92,6 +94,7 @@ def test_each_layout_of_config_layouts_runs_the_line(folder):
 
 @pytest.mark.slow
 def test_the_line_runs_on_with_the_table_held_now_and_then_and_nothing_moves_while_it_is():
+    """Verify periodic table Holds stop motion without preventing line completion."""
     folder = LAYOUTS[0]
     report, sim = asyncio.run(_line(3, 3, 1, sample=True, places=read_stations(folder / "stations.json"),
                                     turn_speed=6.0, line_spec=load(str(folder / "layout.json")),
@@ -104,11 +107,13 @@ def test_the_line_runs_on_with_the_table_held_now_and_then_and_nothing_moves_whi
 
 
 def test_the_watch_tells_a_step_against_the_lane_and_a_turn_off_a_spot_or_the_long_way():
+    """Verify the motion checker detects wrong-way travel and invalid rotations."""
     report = Report()
     check = MotionCheck(SIM, Lines(load(str(LAYOUTS[0] / "layout.json")), SIM), report)
     t = 0.0
 
     def see(*pose):
+        """Feed the next pose to the motion checker with an advancing sample timestamp."""
         nonlocal t
         t += 0.05
         check.sample("S", pose, t)

@@ -24,6 +24,11 @@ The tests marked `slow` run the production line in real time, and the densest tr
 | `tests/test_line.py` | The production line scenario over OPC UA on the simulated driver: on every layout of `config/layouts/`, with holds, and its own checks. |
 | `tests/test_opcua.py` | The OPC UA address space end to end, with a client. |
 | `tests/test_pmc_driver.py` | `PmcDriver` against a stand-in for pmclib that refuses what pmclib refuses: turns, angles, mastership, accidents, pausing, payload, speeds. |
+| `tests/test_blended.py` | Experimental corner geometry, reservations through replanning, traffic conflicts, fallback, Hold, Stop and Abort. Coordinator scenarios also run with both planner variants. |
+
+The optional `python tools/compare_planners.py --run --output <new-directory>` benchmark moves
+xbot 1 on the standard vendor simulator using both planners, records CSV feedback and JSON
+timings, and returns it to (420,180) mm. See [blended execution](planner.md#experimental-blended-execution).
 
 ### Writing a test
 
@@ -128,6 +133,30 @@ PASS clockwise-outwards (101 s): 9 products: 4 finished, 5 discarded; 40 moves, 
 mastership from another pmclib session: the table must abort with MastershipLost (32), and take
 mastership back at a Clear and Reset. It exits 1 when a layout fails; the logs are kept in a
 temporary folder.
+
+### Manual motion probes and demos
+
+The scripts in `tools/` keep their module summaries short; use `--help` for their options.
+The following examples run from the repository root with the controller's Python environment:
+
+| Command | Purpose |
+| --- | --- |
+| `python tools/jog_probe.py` | Inspect the installed jogging API without connecting or moving. |
+| `python tools/jog_probe.py --run --xbot 1 --vx 0.02 --duration 1` | Jog a prepared, levitated and idle xbot for one second and print CSV feedback. Vector speed is capped at 0.05 m/s and duration at 5 seconds. |
+| `python tools/jog_position_probe.py --run --restart --output jog-results` | Test PI position feedback: move 20 mm in X and 15 mm in Y, then return. `--restart` stops jogging before each velocity update. Without it, the test probes whether updates take effect during motion. |
+| `python tools/demo_blended.py --simulate --output demo-preflight` | Run the three-shuttle demo on the kinematic model without connecting to a PMC. |
+| `python tools/demo_blended.py --run --output demo-results` | Run two cycles of three-shuttle traffic on the vendor simulator, then park the movers. |
+| `python tools/compare_planners.py --run --output comparison-results` | Compare classic and blended execution on the standard simulator layout. |
+
+The vendor-simulator probes default to `127.1.1.1`. Release PMT mastership before running them;
+the existing controller must not command the same session concurrently. The demo and comparison
+use the standard simulator layout and xbot IDs described by their commands. These scripts use
+the Python driver directly, rather than OPC UA. Use a new output directory for each run.
+
+The motion probes require `--run` to connect and move. They request stops and disconnect during
+normal exception cleanup, but that cleanup cannot run after process termination or network loss.
+The PI probe does not activate or rotate movers; the demo and comparison use normal coordinator
+connection and initialization. The jog probe's `--ip` option can override its default address.
 
 ### Disconnect from the PMC
 

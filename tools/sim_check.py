@@ -1,22 +1,4 @@
-"""
-Run the line layouts of config/layouts/ against a PMC, Planar Motor's simulator by default: for
-each, a controller with the layout's controller.env, then the product agents of
-tests/line_scenario.py with its stations, which watch the shuttles (lane ways, turns); a line per
-layout, PASS or FAIL.
-
-    python tools/sim_check.py                         # every layout; the simulator running
-    python tools/sim_check.py clockwise-outwards --start-sim --agents 3 --products 4
-    python tools/sim_check.py --hold-every 8 --mastership
-
-With --hold-every S the scenario holds the table every S seconds (nothing may move while it is
-held); with --mastership another pmclib session takes mastership after the scenario: the table
-must abort with MastershipLost (32), and take it back at a Clear and Reset.
-
-Run it with the Python the controller runs with (pmclib from dependencies/). The logs go to a
-temporary folder, named at the end. Exits 1 when a layout fails. Each controller is stopped with
-Ctrl+Break (SIGTERM off Windows), so it disconnects from the PMC: one that is killed leaves the
-simulator writing errors to its trace log for ever.
-"""
+"""Check configured production-line layouts against the vendor PMC simulator."""
 
 import argparse
 import asyncio
@@ -36,12 +18,14 @@ ABORTED, IDLE, EXECUTE, MASTERSHIP_LOST = 9, 4, 6, 32
 
 
 def free_port():
+    """Return an available loopback TCP port; the caller must bind it afterward."""
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
 
 
 def listening(port):
+    """Whether a TCP connection can be established to the local port."""
     with socket.socket() as s:
         s.settimeout(0.5)
         return s.connect_ex(("127.0.0.1", port)) == 0
@@ -54,6 +38,7 @@ def settings(path):
 
 
 def tail(path, n=3):
+    """Return the last nonempty log lines joined for a concise failure report."""
     lines = [line for line in path.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()]
     return " | ".join(lines[-n:])
 
@@ -71,6 +56,7 @@ async def _mastership(endpoint, pmc_ip):
         error = await module.get_child(f"{ns}:ErrorID")
 
         async def wait(wanted, timeout):
+            """Poll the table state until it matches the expected value or times out."""
             t0 = time.monotonic()
             while time.monotonic() - t0 < timeout:
                 if await state.read_value() == wanted:
@@ -163,6 +149,7 @@ def check(layout, args, logs):
 
 
 def main():
+    """Parse scenario options, optionally start the simulator and report each layout's result."""
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("layouts", nargs="*", help="folders of config/layouts/ (default: all)")
     p.add_argument("--pmc-ip", default="127.0.0.1")

@@ -1,0 +1,134 @@
+{
+  "success": true,
+  "groups": [
+    {
+      "group": 1,
+      "elapsed_s": 13.531000000075437,
+      "results": {
+        "1": [
+          true,
+          0
+        ],
+        "2": [
+          true,
+          0
+        ],
+        "3": [
+          true,
+          0
+        ]
+      }
+    },
+    {
+      "group": 2,
+      "elapsed_s": 5.875,
+      "results": {
+        "2": [
+          true,
+          0
+        ],
+        "1": [
+          true,
+          0
+        ],
+        "3": [
+          true,
+          0
+        ]
+      }
+    },
+    {
+      "group": 3,
+      "elapsed_s": 10.452999999979511,
+      "results": {
+        "2": [
+          true,
+          0
+        ],
+        "1": [
+          true,
+          0
+        ],
+        "3": [
+          true,
+          0
+        ]
+      }
+    },
+    {
+      "group": 4,
+      "elapsed_s": 11.390999999945052,
+      "results": {
+        "2": [
+          true,
+          0
+        ],
+        "3": [
+          true,
+          0
+        ],
+        "1": [
+          true,
+          0
+        ]
+      }
+    },
+    {
+      "group": 5,
+      "elapsed_s": 5.859000000054948,
+      "results": {
+        "2": [
+          true,
+          0
+        ],
+        "1": [
+          true,
+          0
+        ],
+        "3": [
+          true,
+          0
+        ]
+      }
+    },
+    {
+      "group": 6,
+      "elapsed_s": 10.437999999965541,
+      "results": {
+        "2": [
+          true,
+          0
+        ],
+        "1": [
+          true,
+          0
+        ],
+        "3": [
+          true,
+          0
+        ]
+      }
+    },
+    {
+      "group": 7,
+      "elapsed_s": 5.109000000054948,
+      "results": {
+        "1": [
+          true,
+          0
+        ],
+        "2": [
+          true,
+          0
+        ],
+        "3": [
+          true,
+          0
+        ]
+      }
+    }
+  ],
+  "peak_moving": 3,
+  "blended_moves": 2,
+  "elapsed_s": 62.67200000002049
+}

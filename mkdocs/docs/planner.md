@@ -189,6 +189,56 @@ it. Nobody needs to stop for the new plan.
 
 ## Executing a plan
 
+### Experimental blended execution
+
+`PLANNER=classic` (the default) retains the original coordinator in `planar/coordinator.py`.
+`PLANNER=blended` selects `planar/coordinator_blended.py`, which shares the existing search and
+module lifecycle and overrides execution. Select it with `python -m planar --planner blended`
+or `.env` plus Docker Compose. Switch back with `--planner classic`; switching requires a
+restart, not a mid-motion change. Python callers can use `PlanarController(..., planner="blended")`.
+
+In free mode, the experimental executor combines two perpendicular straight runs whose
+dependencies are already satisfied. The radius is one quarter of a slot pitch (30 mm on the
+standard table). The driver blocks the empty motion buffer, queues a straight approach,
+a quarter-circle arc and a straight departure, then releases the complete batch. The first
+two commands have matching nonzero ending speeds; the last has **zero final speed**.
+Speed is capped at `sqrt(acceleration * radius)` for the arc. Body orientation stays fixed.
+The whole three-command batch is present before execution, so normal host scheduling delays
+cannot starve an intermediate segment. If loading fails, the driver stops and clears the
+batch before unblocking; if cleanup fails it does not release an incomplete batch.
+
+Before committing, the coordinator checks and claims the complete swept footprint, including
+the additional area on the inside of the corner. It rejects candidates crossing missing
+flyways or closed zones, conflicting with another mover's pose, committed path or planned
+route, or requiring an unmet dependency. Claims remain until the whole compound motion ends;
+no intermediate slot is released based on the old straight-line progress calculation.
+Other movers can replan around the reserved area. Hold retains the claim and pauses the
+motion; Unhold resumes it. Graceful Stop finishes the committed compound move; Abort asks
+the driver to stop immediately and drops the task and claim.
+
+The old executor is used when no corner qualifies, the driver lacks support, or line mode is
+active. Line mode is intentionally unchanged because rounded paths leave lane centre lines.
+If a PMC rejects a buffered command, the task fails normally; the executor does not silently
+retry after a potentially partial execution. Stopping at destinations and for body rotation
+is unchanged. An unobstructed direct move is already continuous and remains a direct move.
+
+This is an experimental execution optimization, not a new route-search cost model. The search
+still estimates stop/start straight runs. Conservative claims can reduce concurrency, and
+small-radius corners can require reduced speed, so overall throughput is not guaranteed to
+improve. The kinematic simulator models a line/arc/line path with a conservative speed cap;
+the PMC determines its own acceleration and jerk profile. Hardware performance is unverified.
+
+`python tools/compare_planners.py --run --output <new-directory>` compares both executors on the
+standard local vendor simulator at `127.1.1.1`, using xbot 1 from (420,180) to (900,660) mm.
+It pins the other movers, stages and returns using the classic planner, and records feedback
+and timings. It uses 0.1 m/s and 0.5 m/s². Run without `--run` to see the motion opt-in message.
+
+In one vendor-simulator comparison, classic took 10.281 s and blended took 9.859 s for that
+route (about 4% faster). Feedback showed the rounded corner with no idle samples there;
+classic stopped at the corner. This is one low-speed route, not a throughput guarantee.
+A separate vendor-simulator check verified Hold/Resume, no drift after Abort, and an empty
+motion buffer after Abort. Neither result establishes hardware performance.
+
 ### Moves and their dependencies
 
 A plan becomes one list of moves per xbot, each one slot. A move may start once the xbot

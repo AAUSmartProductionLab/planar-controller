@@ -1,28 +1,4 @@
-"""
-The OPC UA interface, laid out like a generated module's (work.md, "A generated module"):
-
-  /Objects/<Module>/Occupation      Occupy(Session), Release(Session); Occupied
-  /Objects/<Module>/Module          Reset, Start, Hold, Unhold, Stop, Abort, Clear (Session);
-                                    State, ErrorID
-  /Objects/<Module>/Skills/<Skill>  Start(Session, <parameters>), Stop, Abort, Reset (Session);
-                                    State, ErrorID, Parameters/<p>, Results/<r>
-  /Objects/<Module>/Equipment/<Item>  the table's PMC: Connected, the layout (Columns, Rows,
-                                    FlywaySize, Holes) and Flyways/Flyway_<c>_<r> (power and
-                                    temperatures); its LoadingQueue, IdleRz (writable), Speed
-                                    and Acceleration (SetSpeed), Mode, LineLayout and
-                                    Zones/<name> (State, Xbots; Deactivate, Activate); a
-                                    shuttle's Xbot: X, Y, Rz, XbotState, the payload (PayloadKg,
-                                    PayloadCgHeight, MaxAcceleration; SetPayload), Speed and
-                                    Acceleration (SetSpeed)
-
-Every method answers [Accepted, ErrorID] at once. A MoveToPosition that was accepted finishes
-when the xbot has arrived: its State turns Succeeded (3), or Failed (4) with an ErrorID.
-
-Method calls run the controller's code in a worker thread, so a plan being made never holds up
-the server. Variables are refreshed from the controller every 50 ms and written when they change,
-and once more before a method answers: a client that reads State after Start sees Running, never
-the Succeeded of the run before.
-"""
+"""Publish controller modules, skills and live equipment state over OPC UA."""
 
 import asyncio
 import logging
@@ -38,6 +14,7 @@ NAMESPACE = "urn:aau:smartproductionlab:planar"
 
 
 def _argument(name, type_id, description=""):
+    """Construct an OPC UA method argument with its name and data type."""
     a = ua.Argument()
     a.Name = name
     a.DataType = ua.NodeId(type_id)
@@ -63,7 +40,9 @@ def _set_speed(ctl, xid):
 
 
 class OpcUaServer:
+    """Serve controller commands and synchronized equipment values in the planar namespace."""
     def __init__(self, controller, endpoint="opc.tcp://0.0.0.0:4840/", name="Planar table", namespace=NAMESPACE):
+        """Store the controller, endpoint and namespace, and initialize node tracking."""
         self.ctl = controller
         self.endpoint = endpoint
         self.name = name
@@ -78,6 +57,7 @@ class OpcUaServer:
         self._flyway_nodes = set()
 
     async def init(self):
+        """Initialize the server and create nodes for every table and shuttle module."""
         self.server = Server()
         await self.server.init()
         self.server.set_endpoint(self.endpoint)
@@ -102,6 +82,7 @@ class OpcUaServer:
     # --- building the address space ----------------------------------------------------------
 
     async def _module(self, parent, module, equipment):
+        """Create occupation, state-manager and skill nodes for a module."""
         idx = self.idx
         obj = await parent.add_object(idx, module.name)
 
@@ -125,6 +106,7 @@ class OpcUaServer:
         await equipment(equipment_obj)
 
     async def _skill(self, parent, skill):
+        """Expose a skill's commands, parameters, results and state."""
         idx = self.idx
         obj = await parent.add_object(idx, skill.name)
         names = [p.name for p in skill.parameters]
@@ -132,6 +114,7 @@ class OpcUaServer:
                               for p in skill.parameters]
 
         def start(session, *values):
+            """Map positional OPC UA arguments to the skill's named parameters and start it."""
             return skill.start(session, dict(zip(names, (float(v) for v in values))))
 
         await self._method(obj, "Start", start, inputs)
@@ -148,12 +131,14 @@ class OpcUaServer:
             await self._variable(results, r, lambda n=r: float(skill.results[n]), ua.VariantType.Double)
 
     async def _table_equipment(self, parent):
+        """Publish table layout, routing settings, loading queue, zones and limits."""
         pmc = await parent.add_object(self.idx, "PMC")
         await self._variable(pmc, "Connected", lambda: self.ctl.coordinator.connected, ua.VariantType.Boolean)
         # The layout as the PMC reports it, for a client that draws or describes the table: Columns by
         # Rows flyways of FlywaySize mm, without the Holes ("<column>,<row>" apart by spaces). Zero
         # and empty until the PMC has been connected.
         def layout(read, empty):
+            """Read a layout attribute, using a default before connection."""
             return lambda: read(self.ctl.coordinator.layout) if self.ctl.coordinator.layout else empty
 
         await self._variable(pmc, "Columns", layout(lambda t: t.cols, 0), ua.VariantType.Int32)
@@ -168,6 +153,7 @@ class OpcUaServer:
         # The free shuttles waiting at the loading station, the one on it first, apart by spaces:
         # the one to occupy for the next product. Empty without a loading station.
         def queue():
+            """Format queued xbot IDs as shuttle module names."""
             names = {xid: s.name for xid, s in self.ctl.shuttles.items()}
             return " ".join(names[x] for x in self.ctl.coordinator.queue_order() if x in names)
 
@@ -176,10 +162,12 @@ class OpcUaServer:
         # The orientation idle shuttles are turned to, degrees: writable, a multiple of 90 or NaN
         # (as they are); anything else is not taken and the value reads back as it was.
         def idle_rz():
+            """Read the idle orientation in degrees, or NaN when disabled."""
             rz = self.ctl.coordinator.idle_rz
             return math.nan if rz is None else math.degrees(rz)
 
         def set_idle_rz(deg):
+            """Convert the writable idle orientation from degrees and validate it."""
             error = self.ctl.coordinator.set_idle_rz(math.radians(deg))
             log.info("IdleRz %s: %s", deg, "set" if error == ErrorID.NONE else "refused (a multiple of 90 or NaN)")
 
@@ -210,6 +198,7 @@ class OpcUaServer:
             obj = await zones.add_object(self.idx, name)
 
             def zone(read, name=name):
+                """Read a zone attribute, using a default before it is defined."""
                 return lambda: read(coordinator.zones[name]) if name in coordinator.zones else read(None)
 
             await self._variable(obj, "State", zone(lambda z: z.state if z else "UNKNOWN"), ua.VariantType.String)
@@ -235,9 +224,11 @@ class OpcUaServer:
                 await self._variable(obj, name, read, ua.VariantType.Double)
 
     async def _shuttle_equipment(self, parent, xid):
+        """Publish a shuttle's pose, state, payload and effective motion limits."""
         xbot = await parent.add_object(self.idx, "Xbot")
 
         def reading(i):
+            """Read a pose or state attribute with OPC UA unit conversion and missing-data defaults."""
             snap = self.ctl.coordinator.snapshot(xid)
             if snap is None:  # the PMC not read yet (it is at the first Reset)
                 return math.nan if i < 3 else "UNKNOWN"
@@ -250,7 +241,9 @@ class OpcUaServer:
         await self._variable(xbot, "XbotState", lambda: str(reading(3)), ua.VariantType.String)
 
         def of_agent(read):  # read(the xbot's agent); NaN while there is none (or it says None)
+            """Create a getter for an agent attribute or computed value, defaulting to NaN."""
             def value():
+                """Read the selected agent value, or NaN before the agent exists."""
                 agent = self.ctl.coordinator.agents.get(xid)
                 v = read(agent) if agent is not None else None
                 return math.nan if v is None else float(v)
@@ -278,7 +271,9 @@ class OpcUaServer:
         await self._method(xbot, "SetSpeed", *_set_speed(self.ctl, xid))
 
     async def _method(self, parent, name, fn, inputs):
+        """Register a session-based command returning Accepted and ErrorID."""
         async def handler(_parent, *args):
+            """Run a controller command in a worker thread and return typed OPC UA results."""
             values = [a.Value if a.Value is not None else "" for a in args]
             try:
                 accepted, error = await asyncio.to_thread(fn, *values)
@@ -291,8 +286,9 @@ class OpcUaServer:
         await parent.add_method(self.idx, name, handler, inputs, ANSWER)
 
     async def _variable(self, parent, name, read, vtype, write=None):
-        """A variable kept as read() says; with write, clients may write it: write(value) is
-        called with the controller's lock held, and the variable then reads as read() says."""
+        """A variable kept as read() says; with write, clients may write it: write(value) is called with
+        the controller's lock held, and the variable then reads as read() says.
+        """
         with self.ctl.lock:
             value = read()
         node = await parent.add_variable(self.idx, name, ua.Variant(value, vtype))
@@ -305,14 +301,17 @@ class OpcUaServer:
     # --- keeping variables current -----------------------------------------------------------
 
     def _snapshot(self):
+        """Read all tracked values while holding the controller lock."""
         with self.ctl.lock:
             return [read() for _, read, _ in self._publish]
 
     def _apply(self, write, value):
+        """Apply a writable node value while holding the controller lock."""
         with self.ctl.lock:
             write(value)
 
     async def _refresh(self):
+        """Synchronize writable settings and changed telemetry values with OPC UA nodes."""
         async with self._refreshing:  # one at a time, so an older snapshot never overwrites a newer
             if self._flyways is not None and self.ctl.coordinator.layout is not None \
                     and len(self._flyway_nodes) < len(self.ctl.coordinator.layout.flyways):
@@ -330,4 +329,5 @@ class OpcUaServer:
 
 
 def _same(a, b):
+    """Compare values while treating two NaNs as unchanged."""
     return a == b or (isinstance(a, float) and isinstance(b, float) and math.isnan(a) and math.isnan(b))
